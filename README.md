@@ -1,7 +1,9 @@
 > [!TIP]
-> For **symbolic dynamics and constraints**, also try our [`safe-control-gym`](https://github.com/utiasDSL/safe-control-gym)
+> For research work with **symbolic dynamics and constraints**, also try [`safe-control-gym`](https://github.com/utiasDSL/safe-control-gym)
 >
-> For **ROS2, PX4, ArduPilot, YOLO, and LiDAR**, also try our [`aerial-autonomy-stack`](https://github.com/JacopoPan/aerial-autonomy-stack)
+> For GPU-accelerated, **differentiable, JAX-based simulation**, also try [`crazyflow`](https://github.com/utiasDSL/crazyflow)
+>
+> For production-grade deployment of **ROS2 + PX4/ArduPilot + YOLO/LiDAR**, use [`aerial-autonomy-stack`](https://github.com/JacopoPan/aerial-autonomy-stack)
 
 # gym-pybullet-drones
 
@@ -64,15 +66,6 @@ cd gym-pybullet-drones/
 pytest tests/
 ```
 
-### utiasDSL `pycffirmware` Python Bindings example (multiplatform, single-drone)
-
-Install [`pycffirmware`](https://github.com/utiasDSL/pycffirmware?tab=readme-ov-file#installation) for Ubuntu, macOS, or Windows
-
-```sh
-cd gym_pybullet_drones/examples/
-python3 cff-dsl.py
-```
-
 ### Betaflight SITL example (Ubuntu only)
 
 ```sh
@@ -91,6 +84,15 @@ In another terminal, run the example
 conda activate drones
 cd gym_pybullet_drones/examples/
 python3 beta.py --num_drones 1 # check the steps in the file's docstrings to use multiple drones
+```
+
+### utiasDSL `pycffirmware` Python Bindings example (multiplatform, single-drone)
+
+First, install [`pycffirmware`](https://github.com/utiasDSL/pycffirmware?tab=readme-ov-file#installation) for Ubuntu, macOS, or Windows, then
+
+```sh
+cd gym_pybullet_drones/examples/
+python3 cf.py
 ```
 
 ## Citation
