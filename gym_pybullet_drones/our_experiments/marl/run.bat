@@ -16,7 +16,7 @@ echo ============================================================
 
 echo.
 echo [1/4] MAPPO ...
-"%PYTHON%" -u "%SCRIPT_DIR%mappo.py" %COMMON% --learning-rate 3e-4 --num-steps 2048 --num-minibatches 32 --update-epochs 10 --clip-coef 0.2 --ent-coef 0.01 --vf-coef 0.5 --gae-lambda 0.95 --max-grad-norm 0.5 --target-kl 0.03
+"%PYTHON%" -u "%SCRIPT_DIR%mappo.py" %COMMON% --learning-rate 3e-4 --num-steps 4096 --num-minibatches 32 --update-epochs 10 --clip-coef 0.2 --ent-coef 0.01 --vf-coef 0.5 --gae-lambda 0.95 --max-grad-norm 0.5 --target-kl 0.03
 echo MAPPO exit code: %errorlevel%
 
 echo.

@@ -51,7 +51,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_steps: int = 2048
+    num_steps: int = 4096
     """the number of per-drone transitions per policy rollout"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -146,9 +146,7 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
+    args.num_iterations = args.total_timesteps // args.num_steps  # will recalc batch_size after env
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
 
     if args.track:
@@ -184,13 +182,17 @@ if __name__ == "__main__":
     agent = Agent(single_obs_dim, single_act_dim).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # ALGO Logic: Storage setup  (num_steps = per-drone transitions)
-    obs = torch.zeros((args.num_steps, single_obs_dim)).to(device)
-    actions = torch.zeros((args.num_steps, single_act_dim)).to(device)
-    logprobs = torch.zeros((args.num_steps,)).to(device)
-    rewards = torch.zeros((args.num_steps,)).to(device)
-    dones = torch.zeros((args.num_steps,)).to(device)
-    values = torch.zeros((args.num_steps,)).to(device)
+    # batch_size = num_steps * n_drones (total per-drone transitions per rollout)
+    args.batch_size = int(args.num_steps * n_drones)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+
+    # ALGO Logic: Storage setup  (num_steps = env steps, each stores ALL drones)
+    obs = torch.zeros((args.num_steps, n_drones, single_obs_dim)).to(device)
+    actions = torch.zeros((args.num_steps, n_drones, single_act_dim)).to(device)
+    logprobs = torch.zeros((args.num_steps, n_drones)).to(device)
+    rewards = torch.zeros((args.num_steps, n_drones)).to(device)
+    dones = torch.zeros((args.num_steps,)).to(device)        # shared done
+    values = torch.zeros((args.num_steps, n_drones)).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -202,12 +204,12 @@ if __name__ == "__main__":
         lrnow = frac * args.learning_rate
         optimizer.param_groups[0]["lr"] = lrnow
 
-        # ── Collect num_steps per-drone transitions ──
+        # ── Collect num_steps env transitions ──
         obs_dict, _ = env.reset()
-        buf_ptr = 0
+        step_ptr = 0
         ep_reward = 0.0
 
-        while buf_ptr < args.num_steps:
+        while step_ptr < args.num_steps:
             # Flatten all drones' obs
             flat_obs_list = [flatten_dict_obs(obs_dict[ag], obs_keys) for ag in agents]
             flat_obs_t = torch.tensor(np.array(flat_obs_list), dtype=torch.float32).to(device)
@@ -222,18 +224,16 @@ if __name__ == "__main__":
             done = any(terms.get(ag, False) or truncs.get(ag, False) for ag in agents)
             ep_reward += sum(rews.get(ag, 0.0) for ag in agents)
 
-            # Store per-drone transitions
+            # Store all drones at this env step
+            obs[step_ptr] = flat_obs_t                           # [n_drones, obs_dim]
+            actions[step_ptr] = act_t                            # [n_drones, act_dim]
+            logprobs[step_ptr] = lp_t                            # [n_drones]
             for i in range(n_drones):
-                if buf_ptr >= args.num_steps:
-                    break
-                obs[buf_ptr] = flat_obs_t[i]
-                actions[buf_ptr] = act_t[i]
-                logprobs[buf_ptr] = lp_t[i]
-                rewards[buf_ptr] = rews.get(agents[i], 0.0)
-                dones[buf_ptr] = float(done)
-                values[buf_ptr] = val_t[i].flatten()
-                buf_ptr += 1
-                global_step += 1
+                rewards[step_ptr, i] = rews.get(agents[i], 0.0)
+            dones[step_ptr] = float(done)
+            values[step_ptr] = val_t.flatten()                   # [n_drones]
+            step_ptr += 1
+            global_step += n_drones  # count per-drone transitions
 
             if done:
                 writer.add_scalar("charts/episodic_return", ep_reward, global_step)
@@ -243,30 +243,34 @@ if __name__ == "__main__":
             else:
                 obs_dict = obs_next
 
-        # bootstrap value if not done
+        # bootstrap value if not done — per drone
         with torch.no_grad():
-            last_obs = flatten_dict_obs(obs_dict[agents[0]], obs_keys)
-            next_value = agent.get_value(torch.tensor(last_obs, dtype=torch.float32).to(device)).reshape(1)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
+            last_flat = [flatten_dict_obs(obs_dict[ag], obs_keys) for ag in agents]
+            last_obs_t = torch.tensor(np.array(last_flat), dtype=torch.float32).to(device)
+            next_values = agent.get_value(last_obs_t).squeeze(-1)  # [n_drones]
+
+            advantages = torch.zeros_like(rewards).to(device)      # [num_steps, n_drones]
+            lastgaelam = torch.zeros(n_drones).to(device)
+
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - dones[t]
-                    nextvalues = next_value
+                    nv = next_values
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                    nv = values[t + 1]                              # [n_drones]
+                delta = rewards[t] + args.gamma * nv * nextnonterminal - values[t]
+                lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam
             returns = advantages + values
 
-        # flatten the batch
-        b_obs = obs
-        b_logprobs = logprobs
-        b_actions = actions
-        b_advantages = advantages
-        b_returns = returns
-        b_values = values
+        # flatten [num_steps, n_drones, ...] -> [num_steps * n_drones, ...]
+        b_obs = obs.reshape(-1, single_obs_dim)
+        b_logprobs = logprobs.reshape(-1)
+        b_actions = actions.reshape(-1, single_act_dim)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
