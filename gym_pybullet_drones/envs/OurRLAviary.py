@@ -812,16 +812,6 @@ class OurRLAviary(BaseRLAviary):
                 dist = float(np.linalg.norm(drone_xy - self._obstacle_positions_xy[obstacle_idx, :]))
                 rewards[drone_idx] += self._obstacle_penalty(dist, float(self._obstacle_radii[obstacle_idx]))
 
-        # 出界惩罚：归给对应无人机
-        half = self.ARENA_SIZE_XY_M / 2.0
-        margin = self.WALL_THICKNESS + 0.05
-        for i in range(self.NUM_DRONES):
-            pos = self.pos[i, :]
-            if (abs(float(pos[0])) > (half - margin)
-                    or abs(float(pos[1])) > (half - margin)
-                    or float(pos[2]) < 0.05
-                    or float(pos[2]) > self.WALL_HEIGHT):
-                rewards[i] += -50.0
 
         self._last_drone_rewards = rewards
         return float(np.sum(rewards))
@@ -858,7 +848,7 @@ class OurRLAviary(BaseRLAviary):
         if self._last_obstacle_collision_count > 0:
             return True
         if self._last_out_of_bounds_count > 0:
-            return True
+            pass  # allow wall-sliding, no termination
         return False
 
     ################################################################################
