@@ -193,6 +193,11 @@ runs/
 
 ```bash
 tensorboard --logdir runs
+
+# 先激活环境
+conda activate drones
+# 用 python -m 方式启动
+python -m tensorboard.main --logdir runs
 ```
 
 然后浏览器打开 `http://localhost:6006`。

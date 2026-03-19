@@ -237,6 +237,7 @@ if __name__ == "__main__":
 
             if done:
                 writer.add_scalar("charts/episodic_return", ep_reward, global_step)
+                print(f"global_step={global_step}, episodic_return={ep_reward:.2f}")
                 obs_dict, _ = env.reset()
                 ep_reward = 0.0
             else:
