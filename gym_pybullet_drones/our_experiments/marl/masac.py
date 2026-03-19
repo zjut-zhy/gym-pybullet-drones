@@ -41,11 +41,11 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Environment
-    num_drones: int = 2
+    num_drones: int = 4
     """number of drones in the swarm"""
 
     # Algorithm specific arguments
-    total_timesteps: int = 500000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
