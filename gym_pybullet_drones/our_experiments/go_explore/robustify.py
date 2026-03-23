@@ -1,4 +1,4 @@
-"""Go-Explore Phase 2 — Robustification via backward curriculum.
+"""Go-Explore Phase 2 -- Robustification via snapshot-based curriculum.
 
 Usage
 -----
@@ -6,7 +6,8 @@ Usage
         --archive_path results/go_explore/archive.json \\
         --total_iterations 3000 --n_envs 4
 
-Adapted for PettingZoo ParallelEnv — per-agent observations and actions.
+Adapted for single-agent OurSingleRLAviary -- flat obs / action / reward.
+Uses environment snapshots (instead of action replay) to set starting states.
 """
 
 from __future__ import annotations
@@ -21,22 +22,21 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from gym_pybullet_drones.envs.OurRLAviary_PettingZoo import OurRLAviaryPZ
+from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
 
-from gym_pybullet_drones.our_experiments.go_explore.archive import Archive
+from gym_pybullet_drones.our_experiments.go_explore.archive import Archive, Cell
 from gym_pybullet_drones.our_experiments.go_explore.networks import ActorCritic, ObsEncoder
 from gym_pybullet_drones.our_experiments.go_explore.ppo import PPOTrainer
 from gym_pybullet_drones.our_experiments.go_explore.rollout_buffer import RolloutBuffer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Config
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 @dataclass
 class RobustifyConfig:
-    num_drones: int = 2
     arena_size: float = 10.0
     target_count: int = 18
     obstacle_count: int = 6
@@ -58,7 +58,6 @@ class RobustifyConfig:
     obs_embed_dim: int = 128
     gru_hidden: int = 128
     num_gru_layers: int = 1
-    curriculum_step: int = 5
     curriculum_interval: int = 50
     archive_path: str = "results/go_explore/archive.json"
     log_interval: int = 10
@@ -68,13 +67,12 @@ class RobustifyConfig:
     device: str = "cpu"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Env factory
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def _make_env(cfg: RobustifyConfig, env_seed: int) -> OurRLAviaryPZ:
-    return OurRLAviaryPZ(
-        num_drones=cfg.num_drones,
+def _make_env(cfg: RobustifyConfig, env_seed: int) -> OurSingleRLAviary:
+    return OurSingleRLAviary(
         obs=ObservationType.KIN,
         act=ActionType.VEL,
         gui=False,
@@ -88,122 +86,103 @@ def _make_env(cfg: RobustifyConfig, env_seed: int) -> OurRLAviaryPZ:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Obs helpers — PettingZoo per-agent → batch tensor
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  Obs helpers -- stack flat obs across envs
+# ---------------------------------------------------------------------------
 
-def _obs_keys_shapes(env: OurRLAviaryPZ) -> Dict[str, tuple]:
-    """Per-agent feature shapes from PettingZoo obs space."""
-    agent = env.possible_agents[0]
-    space = env.observation_space(agent)
-    return {k: box.shape for k, box in space.spaces.items()}
+def _obs_keys_shapes(env: OurSingleRLAviary) -> Dict[str, tuple]:
+    """Feature shapes from single-agent obs space."""
+    return {k: box.shape for k, box in env.observation_space.spaces.items()}
 
 
-def _stack_agent_obs(
-    pz_obs_list: List[Dict[str, Dict[str, np.ndarray]]],
-    agents: List[str],
+def _stack_obs(
+    obs_list: List[Dict[str, np.ndarray]],
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
-    """Stack per-env per-agent obs into (n_envs * n_agents, feat) tensors."""
-    keys = list(pz_obs_list[0][agents[0]].keys())
+    """Stack per-env obs into (n_envs, feat) tensors."""
+    keys = list(obs_list[0].keys())
     out = {}
     for key in keys:
-        arrs = []
-        for pz_obs in pz_obs_list:
-            for agent in agents:
-                arrs.append(np.asarray(pz_obs[agent][key], dtype=np.float32))
+        arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
         out[key] = torch.as_tensor(np.stack(arrs), dtype=torch.float32, device=device)
     return out
 
 
-def _stack_agent_obs_np(
-    pz_obs_list: List[Dict[str, Dict[str, np.ndarray]]],
-    agents: List[str],
+def _stack_obs_np(
+    obs_list: List[Dict[str, np.ndarray]],
 ) -> Dict[str, np.ndarray]:
     """Same as above, numpy."""
-    keys = list(pz_obs_list[0][agents[0]].keys())
+    keys = list(obs_list[0].keys())
     out = {}
     for key in keys:
-        arrs = []
-        for pz_obs in pz_obs_list:
-            for agent in agents:
-                arrs.append(np.asarray(pz_obs[agent][key], dtype=np.float32))
+        arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
         out[key] = np.stack(arrs)
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Replay prefix
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  Snapshot-based starting state
+# ---------------------------------------------------------------------------
 
-def _replay_prefix(
-    env: OurRLAviaryPZ,
-    demo_actions: list,
-    replay_len: int,
-) -> tuple:
-    """Reset env and replay ``replay_len`` demo actions.
+def _restore_from_archive(
+    env: OurSingleRLAviary,
+    archive: Archive,
+    rng: np.random.RandomState,
+) -> Dict[str, np.ndarray]:
+    """Reset env, then optionally restore a snapshot from the archive.
 
-    Returns (pz_observations, episode_ended).
+    Returns the observation after restoration.
     """
-    observations, _ = env.reset()
-    for i in range(min(replay_len, len(demo_actions))):
-        stored = demo_actions[i]  # {agent: action}
-        actions = {}
-        for agent in env.agents:
-            if agent in stored:
-                actions[agent] = np.asarray(stored[agent], dtype=np.float32)
-            else:
-                actions[agent] = np.zeros(env.action_space(agent).shape, dtype=np.float32)
-
-        observations, _, terminations, truncations, _ = env.step(actions)
-        if any(terminations.values()) or any(truncations.values()) or not env.agents:
-            observations, _ = env.reset()
-            return observations, True
-    return observations, False
+    obs, _ = env.reset()
+    cell = archive.select()
+    if cell is not None and cell.snapshot is not None:
+        env.restore_snapshot(cell.snapshot)
+        obs = env._computeObs()
+    return obs
 
 
-def _best_trajectory(archive: Archive) -> list:
+def _best_cell(archive: Archive) -> Optional[Cell]:
+    """Return the cell with the highest cumulative reward."""
     best = None
     for cell in archive.cells.values():
         if best is None or cell.cumulative_reward > best.cumulative_reward:
             best = cell
-    return best.action_sequence if best and best.action_sequence else []
+    return best
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def train(cfg: RobustifyConfig) -> None:
     device = torch.device(cfg.device)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    num_drones = cfg.num_drones
     n_envs = cfg.n_envs
-    n_batch = n_envs * num_drones
+    n_batch = n_envs  # single agent per env
 
-    # ── load archive ─────────────────────────────────────────────
+    # -- load archive ---
     archive = Archive(arena_half=cfg.arena_size / 2.0)
     archive.load(cfg.archive_path)
-    demo_actions = _best_trajectory(archive)
-    demo_len = len(demo_actions)
-    print(f"Loaded archive: {len(archive)} cells, best traj len: {demo_len}")
+    archive.seed(cfg.seed)
+    best = _best_cell(archive)
+    has_snapshots = any(c.snapshot is not None for c in archive.cells.values())
+    print(f"Loaded archive: {len(archive)} cells, "
+          f"best reward: {best.cumulative_reward:.2f}" if best else "no cells",
+          f"  snapshots available: {has_snapshots}")
 
-    if demo_len == 0:
-        print("ERROR: no trajectory in archive. Run Phase 1 first.")
+    if len(archive) == 0:
+        print("ERROR: empty archive. Run Phase 1 first.")
         return
 
-    # ── environments ─────────────────────────────────────────────
+    # -- environments ---
     envs = [_make_env(cfg, cfg.seed + i) for i in range(n_envs)]
-    agents = envs[0].possible_agents
 
-    # ── model ────────────────────────────────────────────────────
+    # -- model ---
     obs_shapes = _obs_keys_shapes(envs[0])
     encoder = ObsEncoder(
         self_state_dim=obs_shapes.get("self_state", (6,))[-1],
-        action_history_dim=obs_shapes.get("action_history", (60,))[-1],
-        teammate_state_dim=obs_shapes.get("teammate_state", (48,))[-1],
         target_state_dim=obs_shapes.get("target_state", (54,))[-1],
         obstacle_state_dim=obs_shapes.get("obstacle_state", (24,))[-1],
         embed_dim=cfg.obs_embed_dim,
@@ -226,11 +205,11 @@ def train(cfg: RobustifyConfig) -> None:
     )
 
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-    replay_len = max(0, demo_len - cfg.curriculum_step)
+    rng = np.random.RandomState(cfg.seed)
 
     print("=" * 70)
-    print("Go-Explore Phase 2 — Robustification (backward curriculum)")
-    print(f"  demo_len={demo_len}  initial_replay={replay_len}  "
+    print("Go-Explore Phase 2 -- Robustification (snapshot-based curriculum)")
+    print(f"  archive_cells={len(archive)}  "
           f"n_envs={n_envs}  policy_steps={cfg.policy_steps}")
     print("=" * 70)
 
@@ -241,20 +220,17 @@ def train(cfg: RobustifyConfig) -> None:
         buffer.reset()
         model.eval()
 
-        if iteration > 1 and (iteration - 1) % cfg.curriculum_interval == 0:
-            replay_len = max(0, replay_len - cfg.curriculum_step)
-
-        # ── replay prefix for all envs ───────────────────────
-        pz_obs_list: List[Dict[str, Dict[str, np.ndarray]]] = []
+        # -- restore from archive snapshot for all envs ---
+        obs_list: List[Dict[str, np.ndarray]] = []
         for env in envs:
-            obs, _ = _replay_prefix(env, demo_actions, replay_len)
-            pz_obs_list.append(obs)
+            obs = _restore_from_archive(env, archive, rng)
+            obs_list.append(obs)
 
         hidden = model.initial_hidden(n_batch).to(device)
         ep_rewards = [0.0] * n_envs
 
         for step in range(cfg.policy_steps):
-            obs_batch = _stack_agent_obs(pz_obs_list, agents, device)
+            obs_batch = _stack_obs(obs_list, device)
 
             action_t, lp_t, val_t, hidden = model.get_action(obs_batch, hidden)
 
@@ -262,45 +238,37 @@ def train(cfg: RobustifyConfig) -> None:
             lp_np = lp_t.cpu().numpy()
             val_np = val_t.cpu().numpy()
 
-            new_pz_obs_list = []
+            new_obs_list = []
             rewards = np.zeros(n_batch, dtype=np.float32)
             dones = np.zeros(n_batch, dtype=np.float32)
 
             for e_idx, env in enumerate(envs):
-                # split batch actions into per-agent dict
-                pz_actions = {}
-                for a_idx, agent in enumerate(agents):
-                    flat_idx = e_idx * num_drones + a_idx
-                    pz_actions[agent] = actions_np[flat_idx]
+                action = actions_np[e_idx]
+                obs, rew, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
 
-                new_obs, pz_rew, pz_term, pz_trunc, _ = env.step(pz_actions)
-                done = any(pz_term.values()) or any(pz_trunc.values())
+                rewards[e_idx] = float(rew)
+                dones[e_idx] = float(done)
+                ep_rewards[e_idx] += float(rew)
 
-                for a_idx, agent in enumerate(agents):
-                    flat_idx = e_idx * num_drones + a_idx
-                    rewards[flat_idx] = pz_rew.get(agent, 0.0)
-                    dones[flat_idx] = float(done)
-                    ep_rewards[e_idx] += pz_rew.get(agent, 0.0)
+                new_obs_list.append(obs)
 
-                new_pz_obs_list.append(new_obs)
+                if done:
+                    rst_obs = _restore_from_archive(env, archive, rng)
+                    new_obs_list[-1] = rst_obs
+                    hidden[:, e_idx:e_idx + 1, :] = 0.0
 
-                if done or not env.agents:
-                    rst_obs, _ = _replay_prefix(env, demo_actions, replay_len)
-                    new_pz_obs_list[-1] = rst_obs
-                    s = e_idx * num_drones
-                    hidden[:, s:s + num_drones, :] = 0.0
-
-            buf_obs = _stack_agent_obs_np(pz_obs_list, agents)
+            buf_obs = _stack_obs_np(obs_list)
             buffer.add(
                 obs=buf_obs, action=actions_np, log_prob=lp_np,
                 reward=rewards, value=val_np, done=dones,
                 gru_hidden=hidden.detach().cpu().numpy(),
             )
-            pz_obs_list = new_pz_obs_list
+            obs_list = new_obs_list
             global_step += n_batch
 
         with torch.no_grad():
-            last_obs = _stack_agent_obs(pz_obs_list, agents, device)
+            last_obs = _stack_obs(obs_list, device)
             _, _, last_val, _ = model.get_action(last_obs, hidden)
         buffer.compute_returns(last_val.cpu().numpy(), cfg.gamma, cfg.gae_lambda)
 
@@ -311,7 +279,7 @@ def train(cfg: RobustifyConfig) -> None:
             elapsed = time.time() - t_start
             mean_rew = np.mean(ep_rewards)
             print(
-                f"[iter {iteration:5d}]  replay={replay_len:4d}/{demo_len}  "
+                f"[iter {iteration:5d}]  "
                 f"step={global_step:>9,}  mean_rew={mean_rew:+8.2f}  "
                 f"p_loss={loss_info['policy_loss']:.4f}  "
                 f"v_loss={loss_info['value_loss']:.4f}  "
@@ -321,10 +289,10 @@ def train(cfg: RobustifyConfig) -> None:
         if iteration % cfg.save_interval == 0:
             ckpt = os.path.join(cfg.output_dir, f"model_iter{iteration}.pt")
             torch.save(model.state_dict(), ckpt)
-            print(f"  → saved {ckpt}")
+            print(f"  -> saved {ckpt}")
 
     torch.save(model.state_dict(), os.path.join(cfg.output_dir, "model_final.pt"))
-    print(f"\n✓ Phase 2 finished.  replay_len={replay_len}")
+    print(f"\nPhase 2 finished.")
 
     for env in envs:
         env.close()

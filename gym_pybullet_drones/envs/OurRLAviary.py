@@ -1,4 +1,6 @@
+import copy
 import math
+from collections import deque
 from importlib import resources
 from typing import Optional
 
@@ -908,3 +910,148 @@ class OurRLAviary(BaseRLAviary):
 
     def getObstaclePositions(self):
         return self._obstacle_positions_xy.copy()
+
+    ################################################################################
+    # Snapshot: save / restore full environment state
+    ################################################################################
+
+    def get_snapshot(self) -> dict:
+        """Capture the complete mutable state of the environment.
+
+        Uses ``p.saveState()`` to snapshot all PyBullet physics in one call,
+        then manually saves Python-only state that PyBullet doesn't know
+        about (RNG, entity velocities/direction counters, PID integrators,
+        episode bookkeeping, etc.).
+
+        Returns a plain dict that can be stored externally (e.g. in a
+        Go-Explore archive cell) and later restored with
+        :meth:`restore_snapshot`.
+        """
+        # One-line PyBullet physics snapshot (all bodies, all joints)
+        pyb_state_id = p.saveState(physicsClientId=self.CLIENT)
+
+        return {
+            # -- PyBullet physics (opaque handle) --
+            "pyb_state_id": pyb_state_id,
+            # -- Python-cached kinematics (must stay in sync after restore) --
+            "pos": self.pos.copy(),
+            "vel": self.vel.copy(),
+            "quat": self.quat.copy(),
+            "rpy": self.rpy.copy(),
+            "ang_v": self.ang_v.copy(),
+            "last_clipped_action": self.last_clipped_action.copy(),
+            "rpy_rates": self.rpy_rates.copy() if hasattr(self, "rpy_rates") else None,
+            # -- base counters / buffers --
+            "step_counter": int(self.step_counter),
+            "action_buffer": [np.array(a, copy=True) for a in self.action_buffer],
+            # -- RNG (controls entity direction changes & respawn) --
+            "rng_state": self._rng.get_state(),
+            # -- target Python-only state (velocities & direction timers) --
+            "target_positions": self._target_positions.copy(),
+            "target_velocities_xy": self._target_velocities_xy.copy(),
+            "target_direction_steps": self._target_direction_steps.copy(),
+            # -- obstacle Python-only state --
+            "obstacle_positions_xy": self._obstacle_positions_xy.copy(),
+            "obstacle_velocities_xy": self._obstacle_velocities_xy.copy(),
+            "obstacle_direction_steps": self._obstacle_direction_steps.copy(),
+            "obstacle_radii": self._obstacle_radii.copy(),
+            # -- episode bookkeeping --
+            "episode_target_captures": int(self._episode_target_captures),
+            "targets_spawned": int(self._targets_spawned),
+            "last_target_captures": int(self._last_target_captures),
+            "last_drone_captures": (
+                self._last_drone_captures.copy()
+                if self._last_drone_captures is not None
+                else None
+            ),
+            "last_drone_rewards": (
+                self._last_drone_rewards.copy()
+                if self._last_drone_rewards is not None
+                else None
+            ),
+            "episode_counter": int(self._episode_counter),
+            # -- PID controller integrator state --
+            "ctrl_states": [
+                {
+                    "control_counter": int(c.control_counter),
+                    "last_rpy": c.last_rpy.copy(),
+                    "last_pos_e": c.last_pos_e.copy(),
+                    "integral_pos_e": c.integral_pos_e.copy(),
+                    "last_rpy_e": c.last_rpy_e.copy(),
+                    "integral_rpy_e": c.integral_rpy_e.copy(),
+                }
+                for c in self.ctrl
+            ] if hasattr(self, "ctrl") else [],
+        }
+
+    def restore_snapshot(self, snapshot: dict) -> None:
+        """Restore environment state from a snapshot dict.
+
+        Uses ``p.restoreState()`` to restore all PyBullet physics in one
+        call, then restores Python-only state manually.
+
+        Parameters
+        ----------
+        snapshot : dict
+            A dict previously returned by :meth:`get_snapshot`.
+        """
+        # -- one-line PyBullet physics restore --
+        p.restoreState(snapshot["pyb_state_id"], physicsClientId=self.CLIENT)
+
+        # -- sync the Python-cached kinematics from the restored physics --
+        self.pos = snapshot["pos"].copy()
+        self.vel = snapshot["vel"].copy()
+        self.quat = snapshot["quat"].copy()
+        self.rpy = snapshot["rpy"].copy()
+        self.ang_v = snapshot["ang_v"].copy()
+        self.last_clipped_action = snapshot["last_clipped_action"].copy()
+        if snapshot.get("rpy_rates") is not None and hasattr(self, "rpy_rates"):
+            self.rpy_rates = snapshot["rpy_rates"].copy()
+
+        # -- base counters / buffers --
+        self.step_counter = snapshot["step_counter"]
+        self.action_buffer = deque(
+            [np.array(a, copy=True) for a in snapshot["action_buffer"]],
+            maxlen=self.ACTION_BUFFER_SIZE,
+        )
+
+        # -- RNG --
+        self._rng.set_state(snapshot["rng_state"])
+
+        # -- target Python-only state --
+        self._target_positions = snapshot["target_positions"].copy()
+        self._target_velocities_xy = snapshot["target_velocities_xy"].copy()
+        self._target_direction_steps = snapshot["target_direction_steps"].copy()
+
+        # -- obstacle Python-only state --
+        self._obstacle_positions_xy = snapshot["obstacle_positions_xy"].copy()
+        self._obstacle_velocities_xy = snapshot["obstacle_velocities_xy"].copy()
+        self._obstacle_direction_steps = snapshot["obstacle_direction_steps"].copy()
+        self._obstacle_radii = snapshot["obstacle_radii"].copy()
+
+        # -- episode bookkeeping --
+        self._episode_target_captures = snapshot["episode_target_captures"]
+        self._targets_spawned = snapshot["targets_spawned"]
+        self._last_target_captures = snapshot["last_target_captures"]
+        self._last_drone_captures = (
+            snapshot["last_drone_captures"].copy()
+            if snapshot["last_drone_captures"] is not None
+            else None
+        )
+        self._last_drone_rewards = (
+            snapshot["last_drone_rewards"].copy()
+            if snapshot["last_drone_rewards"] is not None
+            else None
+        )
+        self._episode_counter = snapshot["episode_counter"]
+
+        # -- PID controller integrator state --
+        ctrl_states = snapshot.get("ctrl_states", [])
+        if hasattr(self, "ctrl") and ctrl_states:
+            for c, cs in zip(self.ctrl, ctrl_states):
+                c.control_counter = cs["control_counter"]
+                c.last_rpy = cs["last_rpy"].copy()
+                c.last_pos_e = cs["last_pos_e"].copy()
+                c.integral_pos_e = cs["integral_pos_e"].copy()
+                c.last_rpy_e = cs["last_rpy_e"].copy()
+                c.integral_rpy_e = cs["integral_rpy_e"].copy()

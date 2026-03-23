@@ -8,7 +8,7 @@ class GoExploreConfig:
     """All tuneable knobs live here so that CLI / sweep tools can override them."""
 
     # ── Environment ──────────────────────────────────────────────
-    num_drones: int = 2
+    num_drones: int = 1
     arena_size: float = 10.0
     target_count: int = 18
     obstacle_count: int = 6

@@ -23,7 +23,8 @@ from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.evaluation import evaluate_policy
 
-from gym_pybullet_drones.envs.OurRLAviary import OurRLAviary
+# from gym_pybullet_drones.envs.OurRLAviary import OurRLAviary
+from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary as OurRLAviary
 from gym_pybullet_drones.utils.Logger import Logger
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
 from gym_pybullet_drones.utils.utils import str2bool, sync
@@ -35,19 +36,21 @@ DEFAULT_OUTPUT_FOLDER = "results"
 DEFAULT_COLAB = False
 DEFAULT_OBS = ObservationType("kin")
 DEFAULT_ACT = ActionType("vel")
-DEFAULT_AGENTS = 4
-DEFAULT_TOTAL_TIMESTEPS = int(1e4)
+DEFAULT_AGENTS = 1
+DEFAULT_TOTAL_TIMESTEPS = int(1e6)
 DEFAULT_EVAL_FREQ = 1e4
 DEFAULT_VISUALIZE_COVERAGE = True
 
 
 def _extract_log_state(obs_dict: dict, drone_idx: int, action: np.ndarray) -> np.ndarray:
     """Build a 20-D state-like vector for the existing logger from Dict observations."""
-    self_state = obs_dict["self_state"][drone_idx]
+    ss = obs_dict["self_state"]
+    # Single-agent env returns shape (dim,); multi-agent returns (N, dim)
+    self_state = ss if ss.ndim == 1 else ss[drone_idx]
     pos = self_state[0:3]
     rpy = np.zeros(3, dtype=np.float32)
     vel = self_state[3:6]
-    act = np.asarray(action[drone_idx]).reshape(-1)
+    act = np.asarray(action).reshape(-1) if np.asarray(action).ndim == 1 else np.asarray(action[drone_idx]).reshape(-1)
     if act.shape[0] < 4:
         act = np.pad(act, (0, 4 - act.shape[0]))
     else:
@@ -93,7 +96,7 @@ def run(
         "MultiInputPolicy",
         train_env,
         verbose=1,
-        n_steps=1024,
+        n_steps=2048,
         batch_size=256,
         learning_rate=3e-4,
         gamma=0.99,
@@ -167,8 +170,10 @@ def run(
     for i in range(horizon):
         action, _states = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = test_env.step(action)
-        drone_r = info.get("drone_rewards", np.zeros(num_drones))
-        reward_str = " ".join(f"d{k}={drone_r[k]:+.4f}" for k in range(num_drones))
+        drone_r = info.get("drone_rewards", info.get("drone_reward", np.zeros(num_drones)))
+        if np.isscalar(drone_r) or (isinstance(drone_r, np.ndarray) and drone_r.ndim == 0):
+            drone_r = np.array([float(drone_r)])
+        reward_str = " ".join(f"d{k}={drone_r[k]:+.4f}" for k in range(min(num_drones, len(drone_r))))
         print(
             f"Step {i:04d} reward=[{reward_str}] sum={reward:.4f} terminated={terminated} truncated={truncated} "
             f"coverage={info['coverage_ratio']:.3f} captures={info['target_capture_count']}"

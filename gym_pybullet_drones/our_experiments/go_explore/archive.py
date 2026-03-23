@@ -1,17 +1,20 @@
-"""Archive for original Go-Explore — stores action sequences for replay.
+"""Archive for original Go-Explore -- stores environment snapshots.
 
-Unlike the policy-based version, cells here store the exact action trajectory
-from env reset (start of episode) to the cell, enabling deterministic replay
-for the "return" phase.
+Adapted for single-agent OurSingleRLAviary: observations are flat dicts
+``{key: (feat,)}`` and actions are plain numpy arrays.
 
-Adapted for PettingZoo per-agent observations: ``obs_to_cell_key()`` takes a
-**single-agent** obs dict ``{key: (feat,)}``.
+Instead of storing action sequences for replay (which breaks in dynamic
+environments), each cell now stores a full environment *snapshot* that can
+be restored with ``env.restore_snapshot(cell.snapshot)``.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import os
+import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,9 +26,9 @@ import numpy as np
 class Cell:
     """One entry in the archive."""
 
-    key: Tuple[int, int]
+    key: Tuple[int, int, int]                    # (gx, gy, n_captured)
     center_xy: np.ndarray                        # (2,) world-frame metres
-    action_sequence: List[np.ndarray]             # stored action trajectory
+    snapshot: Optional[dict] = None               # env.get_snapshot() result
     trajectory_cost: int = 0                      # steps to reach
     cumulative_reward: float = 0.0
     visit_count: int = 0
@@ -38,7 +41,7 @@ class Cell:
 
 
 class Archive:
-    """Cell archive with action-replay support.
+    """Cell archive with snapshot-based return support.
 
     Parameters
     ----------
@@ -59,13 +62,13 @@ class Archive:
         self.cell_size = cell_size
         self.arena_half = arena_half
         self.max_cells = max_cells
-        self.cells: Dict[Tuple[int, int], Cell] = {}
+        self.cells: Dict[Tuple[int, int, int], Cell] = {}
         self._rng = np.random.RandomState(0)
 
     def seed(self, s: int) -> None:
         self._rng = np.random.RandomState(s)
 
-    # ── grid helpers ─────────────────────────────────────────────
+    # -- grid helpers --
 
     def _xy_to_key(self, norm_xy: np.ndarray) -> Tuple[int, int]:
         world_xy = norm_xy * self.arena_half
@@ -73,86 +76,81 @@ class Archive:
         gy = int(math.floor(world_xy[1] / self.cell_size))
         return (gx, gy)
 
-    def obs_to_cell_key(self, agent_obs: Dict[str, np.ndarray]) -> Tuple[int, int]:
-        """Return cell key for a single-agent PettingZoo observation.
+    def obs_to_cell_key(self, obs: Dict[str, np.ndarray]) -> Tuple[int, int, int]:
+        """Return cell key for a single-agent observation dict.
 
-        ``agent_obs["self_state"]`` has shape ``(feat_dim,)`` — the first two
-        elements are normalised XY.
+        Key = (grid_x, grid_y, n_captured_targets).
+        The captured count is extracted from target_state: every 3rd element
+        starting at index 2 is a captured flag (0 or 1).
         """
-        self_state = np.asarray(agent_obs["self_state"])
-        return self._xy_to_key(self_state[:2])
+        self_state = np.asarray(obs["self_state"])
+        gx, gy = self._xy_to_key(self_state[:2])
+        target_state = np.asarray(obs["target_state"])
+        n_captured = int(target_state[2::3].sum())
+        return (gx, gy, n_captured)
 
-    def _cell_center(self, key: Tuple[int, int]) -> np.ndarray:
+    def _cell_center(self, key: Tuple[int, int, int]) -> np.ndarray:
+        """Return world-frame XY center (ignoring the capture-count dimension)."""
         return np.array(
             [(key[0] + 0.5) * self.cell_size, (key[1] + 0.5) * self.cell_size],
             dtype=np.float32,
         )
 
-    # ── update ───────────────────────────────────────────────────
+    # -- update --
 
     def update(
         self,
-        trajectory_agent_obs: List[Dict[str, Dict[str, np.ndarray]]],
-        trajectory_actions: List[Dict[str, np.ndarray]],
-        trajectory_rewards: List[Dict[str, float]],
+        trajectory_obs: List[Dict[str, np.ndarray]],
+        trajectory_snapshots: List[dict],
+        trajectory_rewards: List[float],
     ) -> List[Cell]:
         """Process one trajectory and upsert cells.
 
         Parameters
         ----------
-        trajectory_agent_obs : list of {agent: obs_dict}
-            PettingZoo per-step, per-agent observations.
-        trajectory_actions : list of {agent: action}
-            Actions taken at each step *from reset*.
-        trajectory_rewards : list of {agent: float}
-            Per-agent reward at each step.
+        trajectory_obs : list of obs_dict
+            Single-agent obs at each step.
+        trajectory_snapshots : list of dict
+            ``env.get_snapshot()`` result at each step.
+        trajectory_rewards : list of float
+            Scalar reward at each step.
 
         Returns list of newly created cells.
         """
         new_cells: List[Cell] = []
-        # track cumulative reward per agent
-        agents = list(trajectory_agent_obs[0].keys()) if trajectory_agent_obs else []
-        cum_rewards = {a: 0.0 for a in agents}
+        cum_reward = 0.0
 
-        for step_idx, (obs_dict, rew_dict) in enumerate(
-            zip(trajectory_agent_obs, trajectory_rewards)
+        for step_idx, (obs, snapshot, reward) in enumerate(
+            zip(trajectory_obs, trajectory_snapshots, trajectory_rewards)
         ):
-            for agent in obs_dict:
-                cum_rewards[agent] = cum_rewards.get(agent, 0.0) + rew_dict.get(agent, 0.0)
-                key = self.obs_to_cell_key(obs_dict[agent])
-                cum_r = cum_rewards[agent]
+            cum_reward += reward
+            key = self.obs_to_cell_key(obs)
 
-                if key not in self.cells:
-                    if len(self.cells) >= self.max_cells:
-                        continue
-                    cell = Cell(
-                        key=key,
-                        center_xy=self._cell_center(key),
-                        action_sequence=[
-                            {a: np.array(act[a], copy=True) for a in act}
-                            for act in trajectory_actions[: step_idx + 1]
-                        ],
-                        trajectory_cost=step_idx,
-                        cumulative_reward=cum_r,
-                        visit_count=1,
-                    )
-                    cell.update_score()
-                    self.cells[key] = cell
-                    new_cells.append(cell)
-                else:
-                    existing = self.cells[key]
-                    existing.visit_count += 1
-                    if step_idx < existing.trajectory_cost or cum_r > existing.cumulative_reward:
-                        existing.trajectory_cost = step_idx
-                        existing.cumulative_reward = cum_r
-                        existing.action_sequence = [
-                            {a: np.array(act[a], copy=True) for a in act}
-                            for act in trajectory_actions[: step_idx + 1]
-                        ]
-                    existing.update_score()
+            if key not in self.cells:
+                if len(self.cells) >= self.max_cells:
+                    continue
+                cell = Cell(
+                    key=key,
+                    center_xy=self._cell_center(key),
+                    snapshot=copy.deepcopy(snapshot),
+                    trajectory_cost=step_idx,
+                    cumulative_reward=cum_reward,
+                    visit_count=1,
+                )
+                cell.update_score()
+                self.cells[key] = cell
+                new_cells.append(cell)
+            else:
+                existing = self.cells[key]
+                existing.visit_count += 1
+                if step_idx < existing.trajectory_cost or cum_reward > existing.cumulative_reward:
+                    existing.trajectory_cost = step_idx
+                    existing.cumulative_reward = cum_reward
+                    existing.snapshot = copy.deepcopy(snapshot)
+                existing.update_score()
         return new_cells
 
-    # ── selection ────────────────────────────────────────────────
+    # -- selection --
 
     def select(self) -> Optional[Cell]:
         """Score-proportional sampling."""
@@ -165,29 +163,32 @@ class Archive:
         idx = int(self._rng.choice(len(keys), p=probs))
         return self.cells[keys[idx]]
 
-    # ── persistence ──────────────────────────────────────────────
+    # -- persistence --
 
     def save(self, path: str) -> None:
-        """Save archive to JSON (action sequences stored as lists)."""
-        data = []
-        for cell in self.cells.values():
-            # serialise action sequence: list of {agent: list}
-            seq = []
-            for act_dict in cell.action_sequence:
-                seq.append({a: v.tolist() if hasattr(v, 'tolist') else v
-                            for a, v in act_dict.items()})
-            data.append({
+        """Save archive: JSON metadata + pickle for snapshots."""
+        base = Path(path)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_dir = base.parent / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        meta = []
+        for i, cell in enumerate(self.cells.values()):
+            snap_file = str(snapshot_dir / f"cell_{i}.pkl")
+            if cell.snapshot is not None:
+                with open(snap_file, "wb") as f:
+                    pickle.dump(cell.snapshot, f, protocol=pickle.HIGHEST_PROTOCOL)
+            meta.append({
                 "key": list(cell.key),
                 "center_xy": cell.center_xy.tolist(),
                 "trajectory_cost": cell.trajectory_cost,
                 "cumulative_reward": float(cell.cumulative_reward),
                 "visit_count": cell.visit_count,
                 "score": float(cell.score),
-                "action_sequence": seq,
+                "snapshot_file": snap_file if cell.snapshot is not None else None,
             })
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump({"cell_size": self.cell_size, "cells": data}, f)
+        with open(str(base), "w") as f:
+            json.dump({"cell_size": self.cell_size, "cells": meta}, f)
 
     def load(self, path: str) -> None:
         with open(path) as f:
@@ -195,13 +196,15 @@ class Archive:
         self.cell_size = raw.get("cell_size", self.cell_size)
         for entry in raw["cells"]:
             key = tuple(entry["key"])
-            seq = []
-            for act_dict in entry.get("action_sequence", []):
-                seq.append({a: np.array(v, dtype=np.float32) for a, v in act_dict.items()})
+            snapshot = None
+            snap_file = entry.get("snapshot_file")
+            if snap_file and os.path.exists(snap_file):
+                with open(snap_file, "rb") as f:
+                    snapshot = pickle.load(f)
             cell = Cell(
                 key=key,
                 center_xy=np.array(entry["center_xy"], dtype=np.float32),
-                action_sequence=seq,
+                snapshot=snapshot,
                 trajectory_cost=entry["trajectory_cost"],
                 cumulative_reward=entry["cumulative_reward"],
                 visit_count=entry["visit_count"],

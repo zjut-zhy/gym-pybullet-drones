@@ -1,12 +1,13 @@
-"""Original Go-Explore (Phase 1) — action-replay return + random exploration.
+"""Original Go-Explore (Phase 1) -- snapshot-based return + random exploration.
 
 Usage
 -----
     python -m gym_pybullet_drones.our_experiments.go_explore.train \\
-        --num_drones 2 --total_iterations 5000 --n_envs 4
+        --total_iterations 5000 --n_envs 4
 
-Adapted for PettingZoo ParallelEnv — each drone is a named agent with its
-own observation, action, and reward.
+Adapted for single-agent OurSingleRLAviary -- flat obs / action / reward.
+Uses environment snapshots instead of action replay for deterministic state
+restoration in dynamic environments.
 """
 
 from __future__ import annotations
@@ -20,20 +21,19 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from gym_pybullet_drones.envs.OurRLAviary_PettingZoo import OurRLAviaryPZ
+from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
 
 from gym_pybullet_drones.our_experiments.go_explore.archive import Archive, Cell
 from gym_pybullet_drones.our_experiments.go_explore.config import GoExploreConfig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Environment factory
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def _make_env(cfg: GoExploreConfig, env_seed: int) -> OurRLAviaryPZ:
-    return OurRLAviaryPZ(
-        num_drones=cfg.num_drones,
+def _make_env(cfg: GoExploreConfig, env_seed: int) -> OurSingleRLAviary:
+    return OurSingleRLAviary(
         obs=ObservationType.KIN,
         act=ActionType.VEL,
         gui=False,
@@ -47,128 +47,75 @@ def _make_env(cfg: GoExploreConfig, env_seed: int) -> OurRLAviaryPZ:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Random action helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _random_actions(
-    agents: List[str],
-    action_dim: int,
-    rng: np.random.RandomState,
-) -> Dict[str, np.ndarray]:
-    """Generate random actions for all agents."""
-    return {
-        agent: rng.uniform(-1.0, 1.0, size=(action_dim,)).astype(np.float32)
-        for agent in agents
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  One iteration: select → return → explore
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  One iteration: select -> restore snapshot -> explore
+# ---------------------------------------------------------------------------
 
 def _run_iteration(
-    env: OurRLAviaryPZ,
+    env: OurSingleRLAviary,
     archive: Archive,
     cfg: GoExploreConfig,
     rng: np.random.RandomState,
 ) -> dict:
     """Execute one Go-Explore iteration."""
-    agents = env.possible_agents
     act_dim = cfg.action_dim
 
-    # ── select ───────────────────────────────────────────────────
+    # -- select ---
     target_cell: Optional[Cell] = archive.select() if len(archive) > 0 else None
 
-    # ── reset ────────────────────────────────────────────────────
-    observations, infos = env.reset()
+    # -- reset ---
+    obs, info = env.reset()
 
-    # ── return phase (action replay) ─────────────────────────────
-    all_actions: List[Dict[str, np.ndarray]] = []
-    all_obs: List[Dict[str, Dict[str, np.ndarray]]] = []
-    all_rewards: List[Dict[str, float]] = []
-    return_steps = 0
+    # -- return phase (snapshot restore) ---
+    all_obs: List[Dict[str, np.ndarray]] = []
+    all_snapshots: List[dict] = []
+    all_rewards: List[float] = []
+    return_restored = False
 
-    if target_cell is not None and len(target_cell.action_sequence) > 0:
-        for stored_actions in target_cell.action_sequence:
-            # stored_actions is {agent_name: action_array}
-            # ensure all current agents have an action
-            actions = {}
-            for agent in env.agents:
-                if agent in stored_actions:
-                    actions[agent] = np.asarray(stored_actions[agent], dtype=np.float32)
-                else:
-                    actions[agent] = np.zeros(act_dim, dtype=np.float32)
+    if target_cell is not None and target_cell.snapshot is not None:
+        # Directly restore to the archived state -- no replay needed
+        env.restore_snapshot(target_cell.snapshot)
+        # Recompute the observation from the restored state
+        obs = env._computeObs()
+        return_restored = True
 
-            observations, rewards, terminations, truncations, infos = env.step(actions)
-
-            all_actions.append({a: np.array(v, copy=True) for a, v in actions.items()})
-            all_obs.append({a: {k: np.array(v, copy=True) for k, v in obs.items()}
-                           for a, obs in observations.items()})
-            all_rewards.append(dict(rewards))
-            return_steps += 1
-
-            if any(terminations.values()) or any(truncations.values()):
-                new_cells = archive.update(all_obs, all_actions, all_rewards)
-                return {
-                    "new_cells": len(new_cells),
-                    "total_reward": sum(sum(r.values()) for r in all_rewards),
-                    "return_steps": return_steps,
-                    "explore_steps": 0,
-                }
-
-            # PettingZoo clears agents on done
-            if not env.agents:
-                new_cells = archive.update(all_obs, all_actions, all_rewards)
-                return {
-                    "new_cells": len(new_cells),
-                    "total_reward": sum(sum(r.values()) for r in all_rewards),
-                    "return_steps": return_steps,
-                    "explore_steps": 0,
-                }
-
-    # ── explore phase (random actions) ───────────────────────────
+    # -- explore phase (random actions) ---
     explore_count = 0
     for _ in range(cfg.explore_steps):
-        if not env.agents:
-            break
-        actions = _random_actions(env.agents, act_dim, rng)
-        observations, rewards, terminations, truncations, infos = env.step(actions)
+        action = rng.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
+        obs, reward, terminated, truncated, info = env.step(action)
 
-        all_actions.append({a: np.array(v, copy=True) for a, v in actions.items()})
-        all_obs.append({a: {k: np.array(v, copy=True) for k, v in obs.items()}
-                       for a, obs in observations.items()})
-        all_rewards.append(dict(rewards))
+        all_obs.append({k: np.array(v, copy=True) for k, v in obs.items()})
+        all_snapshots.append(env.get_snapshot())
+        all_rewards.append(float(reward))
         explore_count += 1
 
-        if any(terminations.values()) or any(truncations.values()):
-            break
-        if not env.agents:
+        if terminated or truncated:
             break
 
-    # ── archive update ───────────────────────────────────────────
-    new_cells = archive.update(all_obs, all_actions, all_rewards)
+    # -- archive update ---
+    new_cells = archive.update(all_obs, all_snapshots, all_rewards)
 
     return {
         "new_cells": len(new_cells),
-        "total_reward": sum(sum(r.values()) for r in all_rewards),
-        "return_steps": return_steps,
+        "total_reward": sum(all_rewards),
+        "return_restored": return_restored,
         "explore_steps": explore_count,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Main training loop
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def train(cfg: GoExploreConfig) -> None:
-    """Run original Go-Explore (Phase 1 — exploration via action replay)."""
+    """Run original Go-Explore (Phase 1 -- snapshot-based return)."""
     rng = np.random.RandomState(cfg.seed)
 
-    # ── environments ─────────────────────────────────────────────
+    # -- environments ---
     envs = [_make_env(cfg, env_seed=cfg.seed + i) for i in range(cfg.n_envs)]
 
-    # ── archive ──────────────────────────────────────────────────
+    # -- archive ---
     archive = Archive(
         cell_size=cfg.cell_size,
         arena_half=cfg.arena_size / 2.0,
@@ -176,13 +123,13 @@ def train(cfg: GoExploreConfig) -> None:
     )
     archive.seed(cfg.seed)
 
-    # ── output dir ───────────────────────────────────────────────
+    # -- output dir ---
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # ── main loop ────────────────────────────────────────────────
+    # -- main loop ---
     print("=" * 70)
-    print("Original Go-Explore (action-replay)  |  OurRLAviaryPZ")
-    print(f"  n_envs={cfg.n_envs}  n_drones={cfg.num_drones}  "
+    print("Original Go-Explore (snapshot-based)  |  OurSingleRLAviary")
+    print(f"  n_envs={cfg.n_envs}  "
           f"explore_steps={cfg.explore_steps}  iters={cfg.total_iterations}")
     print("=" * 70)
 
@@ -213,19 +160,19 @@ def train(cfg: GoExploreConfig) -> None:
 
         if iteration % cfg.save_interval == 0:
             archive.save(os.path.join(cfg.output_dir, "archive.json"))
-            print(f"  → saved archive ({len(archive)} cells)")
+            print(f"  -> saved archive ({len(archive)} cells)")
 
     archive.save(os.path.join(cfg.output_dir, "archive.json"))
-    print(f"\n✓ Exploration finished.  Total cells: {len(archive)}")
+    print(f"\nExploration finished.  Total cells: {len(archive)}")
 
     for env in envs:
         env.close()
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+# --- CLI ---
 
 def _parse_args() -> GoExploreConfig:
-    parser = argparse.ArgumentParser(description="Original Go-Explore (action-replay)")
+    parser = argparse.ArgumentParser(description="Original Go-Explore (snapshot-based)")
     cfg = GoExploreConfig()
     for f in fields(GoExploreConfig):
         parser.add_argument(f"--{f.name}", type=type(f.default), default=f.default)

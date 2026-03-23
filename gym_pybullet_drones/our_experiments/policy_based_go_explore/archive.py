@@ -1,7 +1,7 @@
 """Archive of discovered cells for Policy-Based Go-Explore.
 
-Adapted for PettingZoo per-agent observations: each agent's obs is
-``{key: (feat,)}`` — a single-drone dict.
+Adapted for single-agent OurSingleRLAviary: observations are flat dicts
+``{key: (feat,)}`` and rewards are scalar floats.
 """
 
 from __future__ import annotations
@@ -15,13 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
-# ─── Cell ────────────────────────────────────────────────────────────────────
-
 @dataclass
 class Cell:
     """One entry in the archive."""
 
-    key: Tuple[int, int]
+    key: Tuple[int, int, int]                    # (gx, gy, n_captured)
     center_xy: np.ndarray                     # (2,) world-frame metres
     obs_snapshot: Optional[Dict[str, Any]]     # single-agent obs at arrival
     trajectory_cost: int = 0                   # steps needed to reach
@@ -34,8 +32,6 @@ class Cell:
         reward_bonus = max(0.0, self.cumulative_reward)
         self.score = novelty + 0.1 * reward_bonus
 
-
-# ─── Archive ─────────────────────────────────────────────────────────────────
 
 class Archive:
     """Shared knowledge-base of discovered cells.
@@ -59,7 +55,7 @@ class Archive:
         self.cell_size = cell_size
         self.arena_half = arena_half
         self.max_cells = max_cells
-        self.cells: Dict[Tuple[int, int], Cell] = {}
+        self.cells: Dict[Tuple[int, int, int], Cell] = {}
         self._rng = np.random.RandomState(0)
 
     def seed(self, s: int) -> None:
@@ -71,12 +67,21 @@ class Archive:
         gy = int(math.floor(world_xy[1] / self.cell_size))
         return (gx, gy)
 
-    def obs_to_cell_key(self, agent_obs: Dict[str, np.ndarray]) -> Tuple[int, int]:
-        """Cell key from a single-agent PettingZoo obs ``{key: (feat,)}``."""
-        self_state = np.asarray(agent_obs["self_state"])
-        return self._xy_to_key(self_state[:2])
+    def obs_to_cell_key(self, obs: Dict[str, np.ndarray]) -> Tuple[int, int, int]:
+        """Cell key from a single-agent obs dict.
 
-    def _cell_center(self, key: Tuple[int, int]) -> np.ndarray:
+        Key = (grid_x, grid_y, n_captured_targets).
+        The captured count is extracted from target_state: every 3rd element
+        starting at index 2 is a captured flag (0 or 1).
+        """
+        self_state = np.asarray(obs["self_state"])
+        gx, gy = self._xy_to_key(self_state[:2])
+        target_state = np.asarray(obs["target_state"])
+        n_captured = int(target_state[2::3].sum())
+        return (gx, gy, n_captured)
+
+    def _cell_center(self, key: Tuple[int, int, int]) -> np.ndarray:
+        """Return world-frame XY center (ignoring the capture-count dimension)."""
         return np.array(
             [(key[0] + 0.5) * self.cell_size, (key[1] + 0.5) * self.cell_size],
             dtype=np.float32,
@@ -86,60 +91,55 @@ class Archive:
         """Return normalised 2-D goal for the network (in [-1, 1])."""
         return np.clip(cell.center_xy / self.arena_half, -1.0, 1.0).astype(np.float32)
 
-    # ── core API ─────────────────────────────────────────────────
+    # -- core API --
 
     def update(
         self,
-        trajectory_agent_obs: List[Dict[str, Dict[str, np.ndarray]]],
-        trajectory_rewards: List[Dict[str, float]],
+        trajectory_obs: List[Dict[str, np.ndarray]],
+        trajectory_rewards: List[float],
     ) -> List[Cell]:
         """Insert / update cells from one trajectory.
 
         Parameters
         ----------
-        trajectory_agent_obs : list of {agent: obs_dict}
-            PettingZoo per-step, per-agent observations.
-        trajectory_rewards : list of {agent: float}
-            Per-agent reward per step.
+        trajectory_obs : list of obs_dict
+            Single-agent obs at each step.
+        trajectory_rewards : list of float
+            Scalar reward per step.
 
         Returns the list of *newly created* cells.
         """
         new_cells: List[Cell] = []
-        agents = list(trajectory_agent_obs[0].keys()) if trajectory_agent_obs else []
-        cum_rewards = {a: 0.0 for a in agents}
+        cum_reward = 0.0
 
-        for step_idx, (obs_dict, rew_dict) in enumerate(
-            zip(trajectory_agent_obs, trajectory_rewards)
+        for step_idx, (obs, reward) in enumerate(
+            zip(trajectory_obs, trajectory_rewards)
         ):
-            for agent in obs_dict:
-                cum_rewards[agent] = cum_rewards.get(agent, 0.0) + rew_dict.get(agent, 0.0)
-                key = self.obs_to_cell_key(obs_dict[agent])
-                cum_r = cum_rewards[agent]
+            cum_reward += reward
+            key = self.obs_to_cell_key(obs)
 
-                if key not in self.cells:
-                    if len(self.cells) >= self.max_cells:
-                        continue
-                    cell = Cell(
-                        key=key,
-                        center_xy=self._cell_center(key),
-                        obs_snapshot={k: np.array(v, copy=True)
-                                      for k, v in obs_dict[agent].items()},
-                        trajectory_cost=step_idx,
-                        cumulative_reward=cum_r,
-                        visit_count=1,
-                    )
-                    cell.update_score()
-                    self.cells[key] = cell
-                    new_cells.append(cell)
-                else:
-                    existing = self.cells[key]
-                    existing.visit_count += 1
-                    if step_idx < existing.trajectory_cost or cum_r > existing.cumulative_reward:
-                        existing.trajectory_cost = step_idx
-                        existing.cumulative_reward = cum_r
-                        existing.obs_snapshot = {k: np.array(v, copy=True)
-                                                  for k, v in obs_dict[agent].items()}
-                    existing.update_score()
+            if key not in self.cells:
+                if len(self.cells) >= self.max_cells:
+                    continue
+                cell = Cell(
+                    key=key,
+                    center_xy=self._cell_center(key),
+                    obs_snapshot={k: np.array(v, copy=True) for k, v in obs.items()},
+                    trajectory_cost=step_idx,
+                    cumulative_reward=cum_reward,
+                    visit_count=1,
+                )
+                cell.update_score()
+                self.cells[key] = cell
+                new_cells.append(cell)
+            else:
+                existing = self.cells[key]
+                existing.visit_count += 1
+                if step_idx < existing.trajectory_cost or cum_reward > existing.cumulative_reward:
+                    existing.trajectory_cost = step_idx
+                    existing.cumulative_reward = cum_reward
+                    existing.obs_snapshot = {k: np.array(v, copy=True) for k, v in obs.items()}
+                existing.update_score()
         return new_cells
 
     def select(self) -> Optional[Cell]:
@@ -152,7 +152,7 @@ class Archive:
         idx = int(self._rng.choice(len(keys), p=probs))
         return self.cells[keys[idx]]
 
-    # ── persistence ──────────────────────────────────────────────
+    # -- persistence --
 
     def save(self, path: str) -> None:
         data = []

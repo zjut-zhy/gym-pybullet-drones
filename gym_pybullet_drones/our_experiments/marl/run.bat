@@ -3,8 +3,8 @@ setlocal
 
 set SCRIPT_DIR=%~dp0
 set PYTHON=D:\anaconda3\envs\drones\python.exe
-set NUM_DRONES=4
-set TOTAL_TIMESTEPS=1000000
+set NUM_DRONES=1
+set TOTAL_TIMESTEPS=100000
 set SEED=1
 set GAMMA=0.99
 set COMMON=--num-drones %NUM_DRONES% --total-timesteps %TOTAL_TIMESTEPS% --seed %SEED% --gamma %GAMMA% --save-model

@@ -1,13 +1,11 @@
-"""Policy-Based Go-Explore training loop — PettingZoo version.
+"""Policy-Based Go-Explore training loop -- single-agent version.
 
 Usage
 -----
     python -m gym_pybullet_drones.our_experiments.policy_based_go_explore.train \\
-        --num_drones 2 --total_iterations 500 --n_envs 4
+        --total_iterations 500 --n_envs 4
 
-With PettingZoo, each drone is already a named agent with per-agent obs
-``{key: (feat,)}``. We stack per-agent observations across all envs into a
-flat batch ``(n_envs * n_drones, feat)`` for the shared policy network.
+Adapted for single-agent OurSingleRLAviary -- flat obs / action / reward.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from gym_pybullet_drones.envs.OurRLAviary_PettingZoo import OurRLAviaryPZ
+from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
 
 from gym_pybullet_drones.our_experiments.policy_based_go_explore.archive import Archive
@@ -36,13 +34,12 @@ from gym_pybullet_drones.our_experiments.policy_based_go_explore.ppo import PPOT
 from gym_pybullet_drones.our_experiments.policy_based_go_explore.rollout_buffer import GoExploreRolloutBuffer
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Environment factory
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def _make_env(cfg: GoExploreConfig, env_seed: int) -> GoExploreEnvWrapper:
-    base_env = OurRLAviaryPZ(
-        num_drones=cfg.num_drones,
+    base_env = OurSingleRLAviary(
         obs=ObservationType.KIN,
         act=ActionType.VEL,
         gui=False,
@@ -69,87 +66,67 @@ def _make_env(cfg: GoExploreConfig, env_seed: int) -> GoExploreEnvWrapper:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Obs helpers — PettingZoo per-agent → batch tensors
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  Obs helpers -- stack flat obs across envs
+# ---------------------------------------------------------------------------
 
 def _obs_keys_shapes(env: GoExploreEnvWrapper) -> Dict[str, tuple]:
-    """Per-agent feature shapes (PettingZoo obs space)."""
-    agent = env.possible_agents[0]
-    space = env.observation_space(agent)
-    return {k: box.shape for k, box in space.spaces.items()}
+    """Feature shapes from single-agent obs space."""
+    return {k: box.shape for k, box in env.observation_space.spaces.items()}
 
 
 def _stack_obs(
-    pz_obs_list: List[Dict[str, Dict[str, np.ndarray]]],
-    agents: List[str],
+    obs_list: List[Dict[str, np.ndarray]],
     device: torch.device,
     exclude: tuple = (),
 ) -> Dict[str, torch.Tensor]:
-    """Stack per-env per-agent obs into (n_envs*n_agents, feat) tensors."""
-    first_agent_obs = pz_obs_list[0][agents[0]]
-    keys = [k for k in first_agent_obs if k not in exclude]
+    """Stack per-env obs into (n_envs, feat) tensors."""
+    keys = [k for k in obs_list[0] if k not in exclude]
     out = {}
     for key in keys:
-        arrs = []
-        for pz_obs in pz_obs_list:
-            for agent in agents:
-                arrs.append(np.asarray(pz_obs[agent][key], dtype=np.float32))
+        arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
         out[key] = torch.as_tensor(np.stack(arrs), dtype=torch.float32, device=device)
     return out
 
 
 def _stack_obs_np(
-    pz_obs_list: List[Dict[str, Dict[str, np.ndarray]]],
-    agents: List[str],
+    obs_list: List[Dict[str, np.ndarray]],
     exclude: tuple = (),
 ) -> Dict[str, np.ndarray]:
-    first_agent_obs = pz_obs_list[0][agents[0]]
-    keys = [k for k in first_agent_obs if k not in exclude]
+    keys = [k for k in obs_list[0] if k not in exclude]
     out = {}
     for key in keys:
-        arrs = []
-        for pz_obs in pz_obs_list:
-            for agent in agents:
-                arrs.append(np.asarray(pz_obs[agent][key], dtype=np.float32))
+        arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
         out[key] = np.stack(arrs)
     return out
 
 
-def _stack_field(pz_obs_list, agents, key, device):
-    arrs = []
-    for pz_obs in pz_obs_list:
-        for agent in agents:
-            arrs.append(np.asarray(pz_obs[agent][key], dtype=np.float32))
+def _stack_field(obs_list, key, device):
+    arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
     return torch.as_tensor(np.stack(arrs), dtype=torch.float32, device=device)
 
 
-def _stack_field_np(pz_obs_list, agents, key):
-    arrs = []
-    for pz_obs in pz_obs_list:
-        for agent in agents:
-            arrs.append(np.asarray(pz_obs[agent][key], dtype=np.float32))
+def _stack_field_np(obs_list, key):
+    arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
     return np.stack(arrs)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 #  Main training loop
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def train(cfg: GoExploreConfig) -> None:
     device = torch.device(cfg.device)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    num_drones = cfg.num_drones
     n_envs = cfg.n_envs
-    n_batch = n_envs * num_drones
+    n_batch = n_envs  # single agent per env
 
-    # ── environments ─────────────────────────────────────────────
+    # -- environments ---
     envs = [_make_env(cfg, env_seed=cfg.seed + i) for i in range(n_envs)]
-    agents = envs[0].possible_agents  # ["drone_0", "drone_1", ...]
 
-    # ── archive ──────────────────────────────────────────────────
+    # -- archive ---
     archive = Archive(
         cell_size=cfg.cell_size,
         arena_half=cfg.arena_size / 2.0,
@@ -159,21 +136,16 @@ def train(cfg: GoExploreConfig) -> None:
     for env in envs:
         env.set_archive(archive)
 
-    # ── model ────────────────────────────────────────────────────
+    # -- model ---
     raw_obs_shapes = _obs_keys_shapes(envs[0])
-    # obs shapes for the network (exclude goal/phase which are separate)
     net_obs_shapes = {k: v for k, v in raw_obs_shapes.items()
                       if k not in ("goal", "phase")}
     self_state_dim = net_obs_shapes.get("self_state", (6,))[-1]
-    action_history_dim = net_obs_shapes.get("action_history", (60,))[-1]
-    teammate_state_dim = net_obs_shapes.get("teammate_state", (48,))[-1]
     target_state_dim = net_obs_shapes.get("target_state", (54,))[-1]
     obstacle_state_dim = net_obs_shapes.get("obstacle_state", (24,))[-1]
 
     obs_encoder = ObsEncoder(
         self_state_dim=self_state_dim,
-        action_history_dim=action_history_dim,
-        teammate_state_dim=teammate_state_dim,
         target_state_dim=target_state_dim,
         obstacle_state_dim=obstacle_state_dim,
         embed_dim=cfg.obs_embed_dim,
@@ -204,8 +176,8 @@ def train(cfg: GoExploreConfig) -> None:
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("Policy-Based Go-Explore  |  OurRLAviaryPZ")
-    print(f"  n_envs={n_envs}  n_drones={num_drones}  batch={n_batch}  "
+    print("Policy-Based Go-Explore  |  OurSingleRLAviary")
+    print(f"  n_envs={n_envs}  batch={n_batch}  "
           f"n_steps={n_steps}  iters={cfg.total_iterations}")
     print("=" * 70)
 
@@ -216,22 +188,21 @@ def train(cfg: GoExploreConfig) -> None:
         buffer.reset()
         model.eval()
 
-        # reset all envs — each returns {agent: obs_dict}
-        pz_obs_list: List[Dict[str, Dict[str, np.ndarray]]] = []
+        # reset all envs
+        obs_list: List[Dict[str, np.ndarray]] = []
         for env in envs:
             obs, _ = env.reset()
-            pz_obs_list.append(obs)
+            obs_list.append(obs)
 
         hidden = model.initial_hidden(batch_size=n_batch).to(device)
 
-        traj_obs: List[List[Dict[str, Dict[str, np.ndarray]]]] = [[] for _ in range(n_envs)]
-        traj_rewards: List[List[Dict[str, float]]] = [[] for _ in range(n_envs)]
+        traj_obs: List[List[Dict[str, np.ndarray]]] = [[] for _ in range(n_envs)]
+        traj_rewards: List[List[float]] = [[] for _ in range(n_envs)]
 
         for step in range(n_steps):
-            # stack per-agent obs across envs → (n_batch, feat)
-            obs_batch = _stack_obs(pz_obs_list, agents, device, exclude=("goal", "phase"))
-            goal_batch = _stack_field(pz_obs_list, agents, "goal", device)
-            phase_batch = _stack_field(pz_obs_list, agents, "phase", device)
+            obs_batch = _stack_obs(obs_list, device, exclude=("goal", "phase"))
+            goal_batch = _stack_field(obs_list, "goal", device)
+            phase_batch = _stack_field(obs_list, "phase", device)
 
             action_t, log_prob_t, value_t, hidden = model.get_action(
                 obs_batch, goal_batch, phase_batch, hidden,
@@ -241,49 +212,38 @@ def train(cfg: GoExploreConfig) -> None:
             log_probs_np = log_prob_t.cpu().numpy()
             values_np = value_t.cpu().numpy()
 
-            new_pz_obs_list = []
+            new_obs_list = []
             rewards_flat = np.zeros(n_batch, dtype=np.float32)
             dones_flat = np.zeros(n_batch, dtype=np.float32)
             valids_flat = np.ones(n_batch, dtype=np.float32)
 
             for e_idx, env in enumerate(envs):
-                # convert batch actions → per-agent dict
-                pz_actions = {}
-                for a_idx, agent in enumerate(agents):
-                    flat_idx = e_idx * num_drones + a_idx
-                    pz_actions[agent] = actions_np[flat_idx]
+                action = actions_np[e_idx]
+                new_obs, rew, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
 
-                new_obs, pz_rew, pz_term, pz_trunc, pz_info = env.step(pz_actions)
-                done = any(pz_term.values()) or any(pz_trunc.values())
+                rewards_flat[e_idx] = float(rew)
+                dones_flat[e_idx] = float(done)
+                valids_flat[e_idx] = float(info.get("valid_mask", True))
 
-                for a_idx, agent in enumerate(agents):
-                    flat_idx = e_idx * num_drones + a_idx
-                    rewards_flat[flat_idx] = pz_rew.get(agent, 0.0)
-                    dones_flat[flat_idx] = float(done)
-                    agent_info = pz_info.get(agent, {})
-                    valids_flat[flat_idx] = float(agent_info.get("valid_mask", True))
+                new_obs_list.append(new_obs)
 
-                new_pz_obs_list.append(new_obs)
-
-                # record for archive (per-agent obs without goal/phase)
-                step_obs = {}
-                for agent in new_obs:
-                    step_obs[agent] = {k: np.array(v, copy=True)
-                                       for k, v in new_obs[agent].items()
-                                       if k not in ("goal", "phase")}
+                # record for archive (without goal/phase)
+                step_obs = {k: np.array(v, copy=True)
+                            for k, v in new_obs.items()
+                            if k not in ("goal", "phase")}
                 traj_obs[e_idx].append(step_obs)
-                traj_rewards[e_idx].append(dict(pz_rew))
+                traj_rewards[e_idx].append(float(rew))
 
-                if done or not env.agents:
+                if done:
                     reset_obs, _ = env.reset()
-                    new_pz_obs_list[-1] = reset_obs
-                    s = e_idx * num_drones
-                    hidden[:, s:s + num_drones, :] = 0.0
+                    new_obs_list[-1] = reset_obs
+                    hidden[:, e_idx:e_idx + 1, :] = 0.0
 
             # store in buffer
-            buf_obs = _stack_obs_np(pz_obs_list, agents, exclude=("goal", "phase"))
-            buf_goal = _stack_field_np(pz_obs_list, agents, "goal")
-            buf_phase = _stack_field_np(pz_obs_list, agents, "phase")
+            buf_obs = _stack_obs_np(obs_list, exclude=("goal", "phase"))
+            buf_goal = _stack_field_np(obs_list, "goal")
+            buf_phase = _stack_field_np(obs_list, "phase")
 
             buffer.add(
                 obs=buf_obs, goal=buf_goal, phase=buf_phase,
@@ -293,14 +253,14 @@ def train(cfg: GoExploreConfig) -> None:
                 gru_hidden=hidden.detach().cpu().numpy(),
             )
 
-            pz_obs_list = new_pz_obs_list
+            obs_list = new_obs_list
             global_step += n_batch
 
         # bootstrap
         with torch.no_grad():
-            last_obs = _stack_obs(pz_obs_list, agents, device, exclude=("goal", "phase"))
-            last_g = _stack_field(pz_obs_list, agents, "goal", device)
-            last_p = _stack_field(pz_obs_list, agents, "phase", device)
+            last_obs = _stack_obs(obs_list, device, exclude=("goal", "phase"))
+            last_g = _stack_field(obs_list, "goal", device)
+            last_p = _stack_field(obs_list, "phase", device)
             _, _, last_val, _ = model.get_action(last_obs, last_g, last_p, hidden)
         buffer.compute_returns(last_val.cpu().numpy(), cfg.gamma, cfg.gae_lambda)
 
@@ -315,9 +275,7 @@ def train(cfg: GoExploreConfig) -> None:
         if iteration % cfg.log_interval == 0 or iteration == 1:
             elapsed = time.time() - t_start
             fps = global_step / max(elapsed, 1e-6)
-            total_rew = sum(
-                sum(sum(r.values()) for r in tr) for tr in traj_rewards
-            )
+            total_rew = sum(sum(tr) for tr in traj_rewards)
             mean_rew = total_rew / n_envs
             print(
                 f"[iter {iteration:5d}]  step={global_step:>9,}  "
@@ -332,18 +290,18 @@ def train(cfg: GoExploreConfig) -> None:
             ckpt = os.path.join(cfg.output_dir, f"model_iter{iteration}.pt")
             torch.save(model.state_dict(), ckpt)
             archive.save(os.path.join(cfg.output_dir, "archive.json"))
-            print(f"  → saved {ckpt}")
+            print(f"  -> saved {ckpt}")
 
     torch.save(model.state_dict(), os.path.join(cfg.output_dir, "model_final.pt"))
     archive.save(os.path.join(cfg.output_dir, "archive.json"))
-    print(f"\n✓ Training finished. Cells: {len(archive)}")
+    print(f"\nTraining finished. Cells: {len(archive)}")
 
     for env in envs:
         env.close()
 
 
 def _parse_args() -> GoExploreConfig:
-    parser = argparse.ArgumentParser(description="Policy-Based Go-Explore (PettingZoo)")
+    parser = argparse.ArgumentParser(description="Policy-Based Go-Explore (single-agent)")
     cfg = GoExploreConfig()
     for f in fields(GoExploreConfig):
         parser.add_argument(f"--{f.name}", type=type(f.default), default=f.default)

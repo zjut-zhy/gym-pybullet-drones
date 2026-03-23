@@ -1,8 +1,7 @@
 """Standard actor-critic for Go-Explore Phase 2 robustification.
 
-No goal conditioning — the policy learns a direct obs → action mapping.
-Follows the same distributed / parameter-sharing design: ``num_drones``
-is folded into the batch dim by the caller.
+No goal conditioning -- the policy learns a direct obs -> action mapping.
+Adapted for single-agent OurSingleRLAviary (no teammate_state, no action_history).
 """
 
 from __future__ import annotations
@@ -24,32 +23,29 @@ def _mlp(in_dim: int, hidden: int, out_dim: int) -> nn.Sequential:
 
 
 class ObsEncoder(nn.Module):
-    """Per-key MLP encoder, identical to the policy-based version."""
+    """Per-key MLP encoder for single-agent observations.
+
+    Expected obs keys: self_state, target_state, obstacle_state.
+    """
 
     def __init__(
         self,
         self_state_dim: int = 6,
-        action_history_dim: int = 60,
-        teammate_state_dim: int = 48,
         target_state_dim: int = 54,
         obstacle_state_dim: int = 24,
         embed_dim: int = 128,
     ) -> None:
         super().__init__()
         self.self_enc = _mlp(self_state_dim, 64, 64)
-        self.act_enc = _mlp(action_history_dim, 64, 32)
-        self.team_enc = _mlp(teammate_state_dim, 64, 64)
         self.tgt_enc = _mlp(target_state_dim, 64, 64)
         self.obs_enc = _mlp(obstacle_state_dim, 64, 32)
-        self.proj = nn.Linear(64 + 32 + 64 + 64 + 32, embed_dim)
+        self.proj = nn.Linear(64 + 64 + 32, embed_dim)
 
     def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         s = self.self_enc(obs["self_state"])
-        a = self.act_enc(obs["action_history"])
-        t = self.team_enc(obs["teammate_state"])
         g = self.tgt_enc(obs["target_state"])
         o = self.obs_enc(obs["obstacle_state"])
-        return self.proj(torch.cat([s, a, t, g, o], dim=-1))
+        return self.proj(torch.cat([s, g, o], dim=-1))
 
 
 class ActorCritic(nn.Module):
