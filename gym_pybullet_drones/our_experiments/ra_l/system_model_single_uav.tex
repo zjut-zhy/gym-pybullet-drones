@@ -11,7 +11,7 @@
 \label{subsec:problem_statement}
 
 We consider the target coverage problem in a three-dimensional environment
-composed of a UAV, $M$~mobile ground targets
+composed of a UAV, $M$~mobile target zones
 $\mathcal{G} = \{G_1, \dots, G_M\}$, and $K$~dynamic obstacle zones
 $\mathcal{T} = \{T_1, \dots, T_K\}$, collectively referred to as entities
 $\mathcal{E} = \{\mathcal{G}, \mathcal{T}\}$.
@@ -21,7 +21,7 @@ The UAV has a fixed observation radius~$R_{\mathrm{obs}}$ and a coverage
 radius~$R_{\mathrm{cov}}$, where $R_{\mathrm{obs}}$ defines the maximum
 sensing range for detecting entities, and $R_{\mathrm{cov}}$ defines the
 proximity required to cover a target.
-The system objective is to \emph{maximise the cumulative target coverage within
+The system objective is to \emph{maximise the cumulative target zone coverage within
 a finite time horizon~$T_{\max}$ while ensuring collision avoidance with all
 obstacle zones}.
 
@@ -190,38 +190,44 @@ location to keep the task complexity constant.
 
 \subsubsection{Dynamic Entities}
 
-Each target $G_m$ is modelled as a cylinder of radius~$r_{\mathrm{tgt}}$
-located at a fixed altitude~$z_{\mathrm{tgt}}$.
-The target moves on the $xy$-plane at a constant speed~$v_{\mathrm{tgt}}$;
+Each target zone $G_m$ is modelled as a cylindrical zone of radius~$r_{\mathrm{tgt}}$.
+The target zone moves on the $xy$-plane at a constant speed~$v_{\mathrm{tgt}}$;
 its heading is re-sampled uniformly from $\mathcal{U}(0, 2\pi)$ every
 $T_{\mathrm{hold}}$~control steps.
-Each obstacle zone $T_k$ is a cylinder of radius
+Each obstacle zone $T_k$ is a cylindrical zone of radius
 $r_k \sim \mathcal{U}(r_{\min}^{\mathrm{obs}}, r_{\max}^{\mathrm{obs}})$,
 where $r_{\min}^{\mathrm{obs}}$ and $r_{\max}^{\mathrm{obs}}$ are the minimum
 and maximum allowable obstacle radii.
 Obstacle zones move on the $xy$-plane at speed~$v_{\mathrm{obs}}$ following
-the same random-heading protocol as targets.
+the same random-heading protocol as target zones.
 Boundary reflections keep all entities within the task region.
 
 \subsubsection{Safety Constraints}
 
-To avoid collisions, the UAV must maintain a safe distance from all obstacle
-zone boundaries.
+To avoid collisions and remain within the task region, the UAV must maintain
+safe distances.
 Let $\mathbf{p}_k^{(t)}$ denote the centre of obstacle zone~$T_k$ at
-time~$t$, and let $R_{\mathrm{safe}} = r_{\mathrm{uav}} + r_k$ denote the
-minimum safe separation.
-The constraint is
+time~$t$.
+Let $R_{\mathrm{safe}}^{1} = r_{\mathrm{uav}} + r_k$ denote the minimum safe
+distance between the UAV and an obstacle zone boundary, and
+$R_{\mathrm{safe}}^{2} = r_{\mathrm{uav}}$ the minimum safe distance
+between the UAV and the task region boundary.
+The constraints are
 \begin{equation}
-  \lVert\mathbf{p}^{(t)} - \mathbf{p}_k^{(t)}\rVert
-    \ge R_{\mathrm{safe}},
-  \quad \forall\, T_k \in \mathcal{T}.
+  \begin{cases}
+    \lVert\mathbf{p}^{(t)} - \mathbf{p}_k^{(t)}\rVert
+      \ge R_{\mathrm{safe}}^{1},
+    & \forall\, T_k \in \mathcal{T}, \\[4pt]
+    d_{\mathrm{b}}^{(t)} \ge R_{\mathrm{safe}}^{2},
+  \end{cases}
   \label{eq:safety}
 \end{equation}
-In addition, a threat zone of width~$d_{\mathrm{threat}}$
-surrounds the UAV; when the distance between the UAV and an obstacle zone
-boundary falls within $(R_{\mathrm{safe}},\, R_{\mathrm{safe}} +
-d_{\mathrm{threat}})$, a proximity penalty is incurred (see
-Section~\ref{subsubsec:reward}).
+where
+$d_{\mathrm{b}}^{(t)} = \min\!\bigl(
+  \tfrac{L}{2} - |x^{(t)}|,\;
+  \tfrac{L}{2} - |y^{(t)}|
+\bigr)$
+is the minimum distance from the UAV centre to the task region boundary.
 
 % ==============================================================
 \subsection{Problem Transformation}
@@ -251,8 +257,8 @@ of three parts:
 \begin{enumerate}
   \item \emph{Self-state}
     $[\mathbf{p}^{(t)},\, \mathbf{v}^{(t)}]$:
-    the position and velocity of the UAV, normalised by the region half-extent
-    and maximum speed, respectively.
+    the position and velocity of the UAV, normalised by the region half-extent~$L/2$
+    and maximum speed~$v_{\max}$, respectively.
   \item \emph{Target state}
     $[\mathbf{p}_m^{(t)} - \mathbf{p}^{(t)}]$,
     $m = 1,\dots,M$:
@@ -278,8 +284,29 @@ controller described in Section~\ref{subsec:system_model}.
 \subsubsection{Reward Function}
 \label{subsubsec:reward}
 
-The reward function decomposes into two components: obstacle zone penalty and
-coverage reward.
+The reward function is inspired by the Artificial Potential Field~(APF) method,
+combining repulsive penalties that grow as the UAV approaches dangerous regions
+with attractive rewards that guide it toward targets.
+It decomposes into three components: obstacle zone penalty, target reward,
+and boundary penalty.
+A common potential kernel is used throughout:
+\begin{equation}
+  \varphi(d,\,d_0) =
+    \alpha\,
+    \left(
+      \frac{1}{d - d_0 + 1}
+      - \frac{1}{\sigma + 1}
+    \right)^{\!2},
+  \label{eq:apf_kernel}
+\end{equation}
+where $\alpha$ is a tunable scaling coefficient, $d$ is the current distance,
+$d_0$ is the contact distance at which hard collision occurs, and
+$\sigma$ is the width of the threat zone surrounding the UAV.
+The potential $\varphi$ equals zero at $d = d_0 + \sigma$ and increases
+monotonically as $d \to d_0$.
+Throughout this section, the subscript~$xy$ denotes the projection of a
+three-dimensional position onto the $xy$-plane, e.g.\
+$\mathbf{p}_{xy} = (x, y)^{\top}$.
 
 \paragraph{Obstacle zone penalty.}
 For obstacle zone~$T_k$ with radius~$r_k$, the planar distance between the
@@ -290,29 +317,49 @@ the UAV and obstacle zone positions, respectively.
 Let $D_k = r_{\mathrm{uav}} + r_k$ denote the contact distance.
 The penalty is
 \begin{equation}
-  r_1 =
+  r_{\mathrm{obs}} =
   \begin{cases}
-    -\alpha_{\mathrm{col}} & 0 \le d \le D_k, \\[3pt]
-    \displaystyle -\frac{\beta}{\exp(d - D_k)}
-    & D_k < d < D_k + d_{\mathrm{threat}}, \\[3pt]
-    0 & \text{otherwise},
+    -20 & d \le D_k, \\[3pt]
+    -\varphi(d,\, D_k)
+    & D_k < d < D_k + \sigma, \\[3pt]
+    0 & \text{otherwise}.
   \end{cases}
-  \label{eq:r1}
+  \label{eq:r_obs}
 \end{equation}
-where $\alpha_{\mathrm{col}}$ is the hard-collision penalty coefficient applied
-when the UAV physically contacts the obstacle zone, $\beta$ is the soft
-threat-zone penalty coefficient that decays exponentially with distance, and
-$d_{\mathrm{threat}}$ is the width of the threat zone.
 
-\paragraph{Coverage reward.}
-Each time the UAV covers a target (i.e.\
-$I_{\mathrm{cov}}(G_m, t) = 1$), it receives a positive reward
-$r_2 = \alpha_{\mathrm{cov}}$, where $\alpha_{\mathrm{cov}}$ is the coverage
-reward coefficient.
+\paragraph{Target reward.}
+Let $d^{*} = \min_{m} \lVert\mathbf{p}_{xy} - \mathbf{p}_{m,xy}\rVert$
+denote the planar distance to the nearest target zone centre,
+where $\mathbf{p}_{m,xy}$ is the $xy$-projection of target zone~$G_m$.
+The reward is
+\begin{equation}
+  r_{\mathrm{tgt}} =
+  \begin{cases}
+    +10
+    & d^{*} \le R_{\mathrm{cov}}, \\[3pt]
+    \varphi(d^{*},\, R_{\mathrm{cov}})
+    & R_{\mathrm{cov}} < d^{*} < R_{\mathrm{cov}} + \sigma, \\[3pt]
+    0 & \text{otherwise}.
+  \end{cases}
+  \label{eq:r_tgt}
+\end{equation}
+
+\paragraph{Boundary penalty.}
+Using $d_{\mathrm{b}}^{(t)}$ defined in~\eqref{eq:safety}, the penalty is
+\begin{equation}
+  r_{\mathrm{bnd}} =
+  \begin{cases}
+    -20 & d_{\mathrm{b}} \le r_{\mathrm{uav}}, \\[3pt]
+    -\varphi(d_{\mathrm{b}},\, r_{\mathrm{uav}})
+    & r_{\mathrm{uav}} < d_{\mathrm{b}} < r_{\mathrm{uav}} + \sigma, \\[3pt]
+    0 & \text{otherwise}.
+  \end{cases}
+  \label{eq:r_bnd}
+\end{equation}
 
 The total reward at each step is
 \begin{equation}
-  R = r_1 + r_2.
+  R = r_{\mathrm{obs}} + r_{\mathrm{tgt}} + r_{\mathrm{bnd}}.
   \label{eq:total_reward}
 \end{equation}
 
@@ -323,6 +370,5 @@ An episode terminates when:
 (i)~the cumulative number of captures reaches
 $\lceil \eta \cdot M \rceil$, where $\eta \in (0,1]$ is the coverage
 completion ratio;
-(ii)~the safety constraint in~\eqref{eq:safety} is violated, i.e.\ the UAV
-collides with any obstacle zone; or
+(ii)~any safety constraint in~\eqref{eq:safety} is violated; or
 (iii)~the episode duration exceeds the maximum time horizon~$T_{\max}$.

@@ -156,48 +156,6 @@ class OurSingleRLAviary(OurRLAviary):
                           high=np.ones(size, dtype=np.float32),
                           dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Pre-process action  (reshape 1-D → (1, D) then delegate)
-    # ------------------------------------------------------------------
-
-    def _preprocessAction(self, action):
-        action = np.asarray(action, dtype=np.float32).reshape(1, -1)
-        return super()._preprocessAction(action)
-
-    # ------------------------------------------------------------------
-    # Reward  (no UAV-pair penalty, single drone only)
-    # ------------------------------------------------------------------
-
-    def _computeReward(self):
-        reward = 0.0
-
-        # 目标覆盖奖励
-        if self._last_drone_captures is not None:
-            reward += 10.0 * float(self._last_drone_captures[0])
-
-        # 障碍物惩罚
-        drone_xy = self.pos[0, :2]
-        for obstacle_idx in range(self.OBSTACLE_COUNT):
-            dist = float(np.linalg.norm(drone_xy - self._obstacle_positions_xy[obstacle_idx, :]))
-            reward += self._obstacle_penalty(dist, float(self._obstacle_radii[obstacle_idx]))
-
-        self._last_drone_rewards = np.array([reward], dtype=np.float32)
-        return float(reward)
-
-    # ------------------------------------------------------------------
-    # Termination  (no UAV-pair collision)
-    # ------------------------------------------------------------------
-
-    def _computeTerminated(self):
-        self._last_uav_collision_count = 0  # 单机无 UAV 碰撞
-        self._last_obstacle_collision_count = self._count_obstacle_collisions()
-        self._last_out_of_bounds_count = self._count_out_of_bounds()
-
-        if self._episode_target_captures >= self.COVERAGE_TARGET_COUNT:
-            return True
-        if self._last_obstacle_collision_count > 0:
-            return True
-        return False
 
     # ------------------------------------------------------------------
     # Info  (simplified, no adjacency / multi-drone fields)

@@ -129,15 +129,18 @@ def _restore_from_archive(
     archive: Archive,
     rng: np.random.RandomState,
 ) -> Dict[str, np.ndarray]:
-    """Reset env, then optionally restore a snapshot from the archive.
+    """Restore a snapshot from the archive, or fresh-reset if unavailable.
 
     Returns the observation after restoration.
     """
-    obs, _ = env.reset()
     cell = archive.select()
     if cell is not None and cell.snapshot is not None:
+        # Restore WITHOUT calling reset() first -- reset() rebuilds
+        # the PyBullet world and invalidates all saved state IDs.
         env.restore_snapshot(cell.snapshot)
         obs = env._computeObs()
+    else:
+        obs, _ = env.reset()
     return obs
 
 

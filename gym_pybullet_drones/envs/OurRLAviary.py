@@ -333,10 +333,11 @@ class OurRLAviary(BaseRLAviary):
         col_y = p.createCollisionShape(p.GEOM_BOX, halfExtents=wall_y_half_extents, physicsClientId=self.CLIENT)
         vis_x = p.createVisualShape(p.GEOM_BOX, halfExtents=wall_x_half_extents, rgbaColor=[0.55, 0.55, 0.55, 1.0], physicsClientId=self.CLIENT)
         vis_y = p.createVisualShape(p.GEOM_BOX, halfExtents=wall_y_half_extents, rgbaColor=[0.55, 0.55, 0.55, 1.0], physicsClientId=self.CLIENT)
-        p.createMultiBody(0, col_x, vis_x, [0.0, +half, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
-        p.createMultiBody(0, col_x, vis_x, [0.0, -half, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
-        p.createMultiBody(0, col_y, vis_y, [+half, 0.0, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
-        p.createMultiBody(0, col_y, vis_y, [-half, 0.0, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
+        wall_offset = half + thickness / 2.0  # 内表面在 ±half
+        p.createMultiBody(0, col_x, vis_x, [0.0, +wall_offset, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
+        p.createMultiBody(0, col_x, vis_x, [0.0, -wall_offset, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
+        p.createMultiBody(0, col_y, vis_y, [+wall_offset, 0.0, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
+        p.createMultiBody(0, col_y, vis_y, [-wall_offset, 0.0, z], [0, 0, 0, 1], physicsClientId=self.CLIENT)
 
         self._obstacle_positions_xy = np.zeros((self.OBSTACLE_COUNT, 2), dtype=np.float32)
         self._obstacle_velocities_xy = np.zeros((self.OBSTACLE_COUNT, 2), dtype=np.float32)
@@ -434,7 +435,7 @@ class OurRLAviary(BaseRLAviary):
         extra_radii: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         half = self.ARENA_SIZE_XY_M / 2.0
-        margin = radius + self.WALL_THICKNESS + max(self.UAV_RADIUS_M, self.TARGET_RADIUS_M) + 0.05
+        margin = radius + max(self.UAV_RADIUS_M, self.TARGET_RADIUS_M) + 0.05
         low = -half + margin
         high = half - margin
         drone_xy = self.pos[:, :2] if hasattr(self, "pos") and self.pos.shape[0] == self.NUM_DRONES else self.INIT_XYZS[:, :2]
@@ -504,7 +505,7 @@ class OurRLAviary(BaseRLAviary):
                 vel = self._sample_entity_velocity(speed)
                 direction_steps[idx] = 0
             next_pos = pos + vel * dt
-            limit = half - float(radii[idx]) - self.WALL_THICKNESS - 0.05
+            limit = half - float(radii[idx]) - 0.05
             for axis in range(2):
                 if next_pos[axis] > limit or next_pos[axis] < -limit:
                     vel[axis] *= -1.0
@@ -779,17 +780,30 @@ class OurRLAviary(BaseRLAviary):
     def _uav_pair_penalty(self, dist: float) -> float:
         collision_dist = 2.0 * self.UAV_RADIUS_M
         if dist <= collision_dist:
-            return -50.0
+            return -20.0
         if dist < collision_dist + self.THREAT_ZONE_WIDTH_M:
-            return -0.02 / math.exp(dist - collision_dist)
+            return -1.0 * (1.0 / (dist - collision_dist + 1.0) - 1.0 / (self.THREAT_ZONE_WIDTH_M + 1.0)) ** 2
         return 0.0
 
     def _obstacle_penalty(self, dist: float, obstacle_radius: float) -> float:
         min_safe_dist = self.UAV_RADIUS_M + obstacle_radius
         if dist <= min_safe_dist:
-            return -50.0
+            return -20.0
         if dist < min_safe_dist + self.THREAT_ZONE_WIDTH_M:
-            return -0.02 / math.exp(dist - min_safe_dist)
+            return -1.0 * (1.0 / (dist - min_safe_dist + 1.0) - 1.0 / (self.THREAT_ZONE_WIDTH_M + 1.0)) ** 2
+        return 0.0
+
+    def _target_attraction(self, dist: float) -> float:
+        capture_dist = self.COVERAGE_RADIUS_M
+        if dist < capture_dist + self.THREAT_ZONE_WIDTH_M:
+            return 1.0 * (1.0 / (dist - capture_dist + 1.0) - 1.0 / (self.THREAT_ZONE_WIDTH_M + 1.0)) ** 2
+        return 0.0
+
+    def _boundary_penalty(self, dist: float) -> float:
+        if dist <= 0:
+            return -20.0
+        if dist < self.THREAT_ZONE_WIDTH_M:
+            return -1.0 * (1.0 / (dist + 1.0) - 1.0 / (self.THREAT_ZONE_WIDTH_M + 1.0)) ** 2
         return 0.0
 
     def _computeReward(self):
@@ -798,6 +812,16 @@ class OurRLAviary(BaseRLAviary):
         # 目标覆盖奖励：归给最近的覆盖无人机
         if self._last_drone_captures is not None:
             rewards += 10.0 * self._last_drone_captures.astype(np.float32)
+
+        # 目标吸引力：每个无人机对最近目标的 APF 引导奖励
+        for drone_idx in range(self.NUM_DRONES):
+            drone_pos = self.pos[drone_idx, :2]
+            min_dist = float('inf')
+            for target_idx in range(self.TARGET_COUNT):
+                dist = float(np.linalg.norm(drone_pos - self._target_positions[target_idx, :2]))
+                if dist < min_dist:
+                    min_dist = dist
+            rewards[drone_idx] += self._target_attraction(min_dist)
 
         # UAV 碰撞惩罚：双方各承担一半
         for i in range(self.NUM_DRONES - 1):
@@ -814,6 +838,17 @@ class OurRLAviary(BaseRLAviary):
                 dist = float(np.linalg.norm(drone_xy - self._obstacle_positions_xy[obstacle_idx, :]))
                 rewards[drone_idx] += self._obstacle_penalty(dist, float(self._obstacle_radii[obstacle_idx]))
 
+        # 边界惩罚：靠近边界的 APF 渐进惩罚（墙内表面在 ±half）
+        half = self.ARENA_SIZE_XY_M / 2.0
+        for drone_idx in range(self.NUM_DRONES):
+            pos = self.pos[drone_idx, :]
+            dist_to_boundary = min(
+                half - abs(float(pos[0])) - self.UAV_RADIUS_M,
+                half - abs(float(pos[1])) - self.UAV_RADIUS_M,
+                float(pos[2]) - 0.05 - self.UAV_RADIUS_M,
+                self.WALL_HEIGHT - float(pos[2]) - self.UAV_RADIUS_M,
+            )
+            rewards[drone_idx] += self._boundary_penalty(dist_to_boundary)
 
         self._last_drone_rewards = rewards
         return float(np.sum(rewards))
@@ -850,7 +885,7 @@ class OurRLAviary(BaseRLAviary):
         if self._last_obstacle_collision_count > 0:
             return True
         if self._last_out_of_bounds_count > 0:
-            pass  # allow wall-sliding, no termination
+            return True
         return False
 
     ################################################################################
@@ -890,15 +925,15 @@ class OurRLAviary(BaseRLAviary):
 
     def _count_out_of_bounds(self) -> int:
         half = self.ARENA_SIZE_XY_M / 2.0
-        margin = self.WALL_THICKNESS + 0.05
+        r = self.UAV_RADIUS_M
         count = 0
         for i in range(self.NUM_DRONES):
             pos = self.pos[i, :]
             if (
-                abs(float(pos[0])) > (half - margin)
-                or abs(float(pos[1])) > (half - margin)
-                or float(pos[2]) < 0.05
-                or float(pos[2]) > self.WALL_HEIGHT
+                abs(float(pos[0])) + r >= half
+                or abs(float(pos[1])) + r >= half
+                or float(pos[2]) - r < 0.05
+                or float(pos[2]) + r > self.WALL_HEIGHT
             ):
                 count += 1
         return count
@@ -918,22 +953,16 @@ class OurRLAviary(BaseRLAviary):
     def get_snapshot(self) -> dict:
         """Capture the complete mutable state of the environment.
 
-        Uses ``p.saveState()`` to snapshot all PyBullet physics in one call,
-        then manually saves Python-only state that PyBullet doesn't know
-        about (RNG, entity velocities/direction counters, PID integrators,
-        episode bookkeeping, etc.).
+        All state is saved in pure Python / NumPy — no ``p.saveState()`` is
+        used, so snapshots are portable across PyBullet clients and don't
+        leak memory.
 
         Returns a plain dict that can be stored externally (e.g. in a
         Go-Explore archive cell) and later restored with
         :meth:`restore_snapshot`.
         """
-        # One-line PyBullet physics snapshot (all bodies, all joints)
-        pyb_state_id = p.saveState(physicsClientId=self.CLIENT)
-
         return {
-            # -- PyBullet physics (opaque handle) --
-            "pyb_state_id": pyb_state_id,
-            # -- Python-cached kinematics (must stay in sync after restore) --
+            # -- Python-cached kinematics --
             "pos": self.pos.copy(),
             "vel": self.vel.copy(),
             "quat": self.quat.copy(),
@@ -946,11 +975,11 @@ class OurRLAviary(BaseRLAviary):
             "action_buffer": [np.array(a, copy=True) for a in self.action_buffer],
             # -- RNG (controls entity direction changes & respawn) --
             "rng_state": self._rng.get_state(),
-            # -- target Python-only state (velocities & direction timers) --
+            # -- target state --
             "target_positions": self._target_positions.copy(),
             "target_velocities_xy": self._target_velocities_xy.copy(),
             "target_direction_steps": self._target_direction_steps.copy(),
-            # -- obstacle Python-only state --
+            # -- obstacle state --
             "obstacle_positions_xy": self._obstacle_positions_xy.copy(),
             "obstacle_velocities_xy": self._obstacle_velocities_xy.copy(),
             "obstacle_direction_steps": self._obstacle_direction_steps.copy(),
@@ -987,18 +1016,16 @@ class OurRLAviary(BaseRLAviary):
     def restore_snapshot(self, snapshot: dict) -> None:
         """Restore environment state from a snapshot dict.
 
-        Uses ``p.restoreState()`` to restore all PyBullet physics in one
-        call, then restores Python-only state manually.
+        All PyBullet bodies are repositioned manually via
+        ``p.resetBasePositionAndOrientation`` / ``p.resetBaseVelocity``,
+        so the snapshot is portable across PyBullet clients and sessions.
 
         Parameters
         ----------
         snapshot : dict
             A dict previously returned by :meth:`get_snapshot`.
         """
-        # -- one-line PyBullet physics restore --
-        p.restoreState(snapshot["pyb_state_id"], physicsClientId=self.CLIENT)
-
-        # -- sync the Python-cached kinematics from the restored physics --
+        # -- restore Python-cached kinematics --
         self.pos = snapshot["pos"].copy()
         self.vel = snapshot["vel"].copy()
         self.quat = snapshot["quat"].copy()
@@ -1018,12 +1045,12 @@ class OurRLAviary(BaseRLAviary):
         # -- RNG --
         self._rng.set_state(snapshot["rng_state"])
 
-        # -- target Python-only state --
+        # -- target state --
         self._target_positions = snapshot["target_positions"].copy()
         self._target_velocities_xy = snapshot["target_velocities_xy"].copy()
         self._target_direction_steps = snapshot["target_direction_steps"].copy()
 
-        # -- obstacle Python-only state --
+        # -- obstacle state --
         self._obstacle_positions_xy = snapshot["obstacle_positions_xy"].copy()
         self._obstacle_velocities_xy = snapshot["obstacle_velocities_xy"].copy()
         self._obstacle_direction_steps = snapshot["obstacle_direction_steps"].copy()
@@ -1055,3 +1082,36 @@ class OurRLAviary(BaseRLAviary):
                 c.integral_pos_e = cs["integral_pos_e"].copy()
                 c.last_rpy_e = cs["last_rpy_e"].copy()
                 c.integral_rpy_e = cs["integral_rpy_e"].copy()
+
+        # -- sync PyBullet bodies from restored Python state --
+        for i in range(self.NUM_DRONES):
+            p.resetBasePositionAndOrientation(
+                self.DRONE_IDS[i],
+                self.pos[i].tolist(),
+                self.quat[i].tolist(),
+                physicsClientId=self.CLIENT,
+            )
+            p.resetBaseVelocity(
+                self.DRONE_IDS[i],
+                self.vel[i].tolist(),
+                self.ang_v[i].tolist(),
+                physicsClientId=self.CLIENT,
+            )
+        for idx in range(self.OBSTACLE_COUNT):
+            if idx < len(self._obstacle_body_ids):
+                p.resetBasePositionAndOrientation(
+                    self._obstacle_body_ids[idx],
+                    [float(self._obstacle_positions_xy[idx, 0]),
+                     float(self._obstacle_positions_xy[idx, 1]),
+                     self.OBSTACLE_Z_M],
+                    [0, 0, 0, 1],
+                    physicsClientId=self.CLIENT,
+                )
+        for idx in range(self.TARGET_COUNT):
+            if idx < len(self._target_body_ids):
+                p.resetBasePositionAndOrientation(
+                    self._target_body_ids[idx],
+                    self._target_positions[idx].tolist(),
+                    [0, 0, 0, 1],
+                    physicsClientId=self.CLIENT,
+                )

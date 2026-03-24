@@ -63,24 +63,26 @@ def _run_iteration(
     # -- select ---
     target_cell: Optional[Cell] = archive.select() if len(archive) > 0 else None
 
-    # -- reset ---
-    obs, info = env.reset()
-
-    # -- return phase (snapshot restore) ---
+    # -- return phase (snapshot restore OR fresh reset) ---
     all_obs: List[Dict[str, np.ndarray]] = []
     all_snapshots: List[dict] = []
     all_rewards: List[float] = []
     return_restored = False
 
     if target_cell is not None and target_cell.snapshot is not None:
-        # Directly restore to the archived state -- no replay needed
+        # Restore to the archived state WITHOUT calling reset() first,
+        # because reset() rebuilds the PyBullet world and invalidates
+        # all previously saved p.saveState() IDs.
         env.restore_snapshot(target_cell.snapshot)
-        # Recompute the observation from the restored state
         obs = env._computeObs()
         return_restored = True
+    else:
+        # No snapshot to restore -- do a fresh reset
+        obs, info = env.reset()
 
     # -- explore phase (random actions) ---
     explore_count = 0
+    all_n_captured: List[int] = []
     for _ in range(cfg.explore_steps):
         action = rng.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
@@ -88,13 +90,15 @@ def _run_iteration(
         all_obs.append({k: np.array(v, copy=True) for k, v in obs.items()})
         all_snapshots.append(env.get_snapshot())
         all_rewards.append(float(reward))
+        all_n_captured.append(int(info.get("target_capture_count", 0)))
         explore_count += 1
 
         if terminated or truncated:
             break
 
     # -- archive update ---
-    new_cells = archive.update(all_obs, all_snapshots, all_rewards)
+    new_cells = archive.update(all_obs, all_snapshots, all_rewards,
+                               trajectory_n_captured=all_n_captured)
 
     return {
         "new_cells": len(new_cells),

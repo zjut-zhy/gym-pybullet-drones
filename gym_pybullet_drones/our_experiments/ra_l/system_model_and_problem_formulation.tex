@@ -13,7 +13,7 @@
 We consider the multi-target cooperative coverage problem in a three-dimensional
 environment composed of $N$~homogeneous UAVs
 $\mathcal{U} = \{U_1, \dots, U_N\}$,
-$M$~mobile ground targets $\mathcal{G} = \{G_1, \dots, G_M\}$, and
+$M$~mobile target zones $\mathcal{G} = \{G_1, \dots, G_M\}$, and
 $K$~dynamic obstacle zones $\mathcal{T} = \{T_1, \dots, T_K\}$, collectively
 referred to as entities
 $\mathcal{E} = \{\mathcal{U}, \mathcal{G}, \mathcal{T}\}$.
@@ -22,7 +22,7 @@ initialised within a bounded task region.
 All UAVs share identical physical parameters, with a fixed observation
 radius~$R_{\mathrm{obs}}$ (maximum sensing range) and a coverage
 radius~$R_{\mathrm{cov}}$ (proximity required to cover a target).
-The system objective is to \emph{maximise the cumulative target coverage within
+The system objective is to \emph{maximise the cumulative target zone coverage within
 a finite time horizon~$T_{\max}$ while ensuring collision avoidance}.
 
 % ==============================================================
@@ -193,28 +193,30 @@ location to keep the task complexity constant.
 
 \subsubsection{Dynamic Entities}
 
-Each target $G_m$ is modelled as a cylinder of radius~$r_{\mathrm{tgt}}$
-located at a fixed altitude~$z_{\mathrm{tgt}}$.
-The target moves on the $xy$-plane at a constant speed~$v_{\mathrm{tgt}}$;
+Each target zone $G_m$ is modelled as a cylindrical zone of radius~$r_{\mathrm{tgt}}$.
+The target zone moves on the $xy$-plane at a constant speed~$v_{\mathrm{tgt}}$;
 its heading is re-sampled uniformly from $\mathcal{U}(0, 2\pi)$ every
 $T_{\mathrm{hold}}$~control steps.
-Each obstacle zone $T_k$ is a cylinder of radius
+Each obstacle zone $T_k$ is a cylindrical zone of radius
 $r_k \sim \mathcal{U}(r_{\min}^{\mathrm{obs}}, r_{\max}^{\mathrm{obs}})$,
 where $r_{\min}^{\mathrm{obs}}$ and $r_{\max}^{\mathrm{obs}}$ are the minimum
 and maximum allowable obstacle radii.
 Obstacle zones move on the $xy$-plane at speed~$v_{\mathrm{obs}}$ following
-the same random-heading protocol as targets.
+the same random-heading protocol as target zones.
 Boundary reflections keep all entities within the task region.
 
 \subsubsection{Safety Constraints}
 
-To avoid collisions, UAVs must maintain safe distances.
+To avoid collisions and remain within the task region, UAVs must maintain safe
+distances.
 Let $\mathbf{p}_k^{(t)}$ denote the centre of obstacle zone~$T_k$ at
 time~$t$.
 Let $R_{\mathrm{safe}}^{1} = 2\,r_{\mathrm{uav}}$ denote the minimum safe
-distance between UAVs, and
+distance between UAVs,
 $R_{\mathrm{safe}}^{2} = r_{\mathrm{uav}} + r_k$ the minimum safe distance
-between a UAV and an obstacle zone boundary.
+between a UAV and an obstacle zone boundary, and
+$R_{\mathrm{safe}}^{3} = r_{\mathrm{uav}}$ the minimum safe distance
+between a UAV and the task region boundary.
 The constraints are
 \begin{equation}
   \begin{cases}
@@ -224,13 +226,18 @@ The constraints are
     \lVert\mathbf{p}_i^{(t)} - \mathbf{p}_k^{(t)}\rVert
       \ge R_{\mathrm{safe}}^{2},
     & \forall\, U_i \in \mathcal{U},\;
-      \forall\, T_k \in \mathcal{T}.
+      \forall\, T_k \in \mathcal{T}, \\[4pt]
+    d_{\mathrm{b},i}^{(t)} \ge R_{\mathrm{safe}}^{3},
+    & \forall\, U_i \in \mathcal{U},
   \end{cases}
   \label{eq:safety}
 \end{equation}
-Each UAV is additionally surrounded by a threat zone of
-width~$d_{\mathrm{threat}}$; when another entity enters this zone, a proximity
-penalty is incurred (see Section~\ref{subsubsec:reward}).
+where
+$d_{\mathrm{b},i}^{(t)} = \min\!\bigl(
+  \tfrac{L}{2} - |x_i^{(t)}|,\;
+  \tfrac{L}{2} - |y_i^{(t)}|
+\bigr)$
+is the minimum distance from the centre of~$U_i$ to the task region boundary.
 
 % ==============================================================
 \subsection{Problem Transformation}
@@ -268,8 +275,8 @@ of four parts:
 \begin{enumerate}
   \item \emph{Self-state}
     $[\mathbf{p}_i^{(t)},\, \mathbf{v}_i^{(t)}]$:
-    the position and velocity of~$U_i$, normalised by the region half-extent
-    and maximum speed, respectively.
+    the position and velocity of~$U_i$, normalised by the region half-extent~$L/2$
+    and maximum speed~$v_{\max}$, respectively.
   \item \emph{Teammate state}
     $[\mathbf{p}_j^{(t)} - \mathbf{p}_i^{(t)},\,
       \mathbf{v}_j^{(t)} - \mathbf{v}_i^{(t)}]$,
@@ -300,54 +307,97 @@ described in Section~\ref{subsec:system_model}.
 \subsubsection{Reward Function}
 \label{subsubsec:reward}
 
-The reward function decomposes into two components: collision penalty and
-coverage reward.
+The reward function is inspired by the Artificial Potential Field~(APF) method,
+combining repulsive penalties that grow as a UAV approaches dangerous regions
+with attractive rewards that guide it toward targets.
+It decomposes into four components: inter-UAV penalty, obstacle zone penalty,
+target reward, and boundary penalty.
+A common potential kernel is used throughout:
+\begin{equation}
+  \varphi(d,\,d_0) =
+    \alpha\,
+    \left(
+      \frac{1}{d - d_0 + 1}
+      - \frac{1}{\sigma + 1}
+    \right)^{\!2},
+  \label{eq:apf_kernel}
+\end{equation}
+where $\alpha$ is a tunable scaling coefficient, $d$ is the current distance,
+$d_0$ is the contact distance at which hard collision occurs, and
+$\sigma$ is the width of the threat zone surrounding each UAV.
+The potential $\varphi$ equals zero at $d = d_0 + \sigma$ and increases
+monotonically as $d \to d_0$.
+Throughout this section, the subscript~$xy$ denotes the projection of a
+three-dimensional position onto the $xy$-plane, e.g.\
+$\mathbf{p}_{i,xy} = (x_i, y_i)^{\top}$.
 
-\paragraph{Collision penalty.}
-Each UAV is surrounded by a threat zone of width~$d_{\mathrm{threat}}$.
+\paragraph{Inter-UAV penalty.}
 For a UAV pair $(U_i, U_j)$ with distance
 $d = \lVert\mathbf{p}_i - \mathbf{p}_j\rVert$:
 \begin{equation}
-  r_1 =
+  r_{\mathrm{uav}} =
   \begin{cases}
-    -\alpha_{\mathrm{col}} & 0 \le d \le 2\,r_{\mathrm{uav}}, \\[3pt]
-    \displaystyle -\frac{\beta}{\exp(d - 2\,r_{\mathrm{uav}})}
-    & 2\,r_{\mathrm{uav}} < d < 2\,r_{\mathrm{uav}} + d_{\mathrm{threat}},
-    \\[3pt]
-    0 & \text{otherwise},
+    -20 & d \le 2\,r_{\mathrm{uav}}, \\[3pt]
+    -\varphi(d,\, 2\,r_{\mathrm{uav}})
+    & 2\,r_{\mathrm{uav}} < d < 2\,r_{\mathrm{uav}} + \sigma, \\[3pt]
+    0 & \text{otherwise}.
   \end{cases}
-  \label{eq:r1}
+  \label{eq:r_uav}
 \end{equation}
-where $\alpha_{\mathrm{col}}$ is the hard-collision penalty coefficient applied
-when two UAVs physically collide, and $\beta$ is the soft threat-zone
-penalty coefficient that decays exponentially with distance.
+The penalty is split equally between both UAVs.
 
-Similarly, for UAV~$U_i$ and obstacle zone~$T_k$ with planar distance
+\paragraph{Obstacle zone penalty.}
+For UAV~$U_i$ and obstacle zone~$T_k$ with planar distance
 $d = \lVert\mathbf{p}_{i,xy} - \mathbf{p}_{k,xy}\rVert$, where
 $\mathbf{p}_{i,xy}$ and $\mathbf{p}_{k,xy}$ are the $xy$-projections of the
-UAV and obstacle zone positions:
+UAV and obstacle zone positions, respectively.
+Let $D_k = r_{\mathrm{uav}} + r_k$ denote the contact distance.
+The penalty is
 \begin{equation}
-  r_2 =
+  r_{\mathrm{obs}} =
   \begin{cases}
-    -\alpha_{\mathrm{col}} & 0 \le d \le D_k, \\[3pt]
-    \displaystyle -\frac{\beta}{\exp(d - D_k)}
-    & D_k < d < D_k + d_{\mathrm{threat}}, \\[3pt]
-    0 & \text{otherwise},
+    -20 & d \le D_k, \\[3pt]
+    -\varphi(d,\, D_k)
+    & D_k < d < D_k + \sigma, \\[3pt]
+    0 & \text{otherwise}.
   \end{cases}
-  \label{eq:r2}
+  \label{eq:r_obs}
 \end{equation}
-where $D_k = r_{\mathrm{uav}} + r_k$ is the contact distance between the UAV
-body and the obstacle zone boundary.
 
-\paragraph{Coverage reward.}
-Each time a UAV covers a target (i.e.\
-$I_{\mathrm{cov}}(U_i, G_m, t) = 1$), the nearest covering UAV receives a
-positive reward $r_3 = \alpha_{\mathrm{cov}}$, where $\alpha_{\mathrm{cov}}$ is
-the coverage reward coefficient.
+\paragraph{Target reward.}
+Let $d_i^{*} = \min_{m} \lVert\mathbf{p}_{i,xy} - \mathbf{p}_{m,xy}\rVert$
+denote the planar distance from~$U_i$ to the nearest target zone centre,
+where $\mathbf{p}_{m,xy}$ is the $xy$-projection of target zone~$G_m$.
+The reward is
+\begin{equation}
+  r_{\mathrm{tgt}} =
+  \begin{cases}
+    +10
+    & d_i^{*} \le R_{\mathrm{cov}}, \\[3pt]
+    \varphi(d_i^{*},\, R_{\mathrm{cov}})
+    & R_{\mathrm{cov}} < d_i^{*} < R_{\mathrm{cov}} + \sigma, \\[3pt]
+    0 & \text{otherwise}.
+  \end{cases}
+  \label{eq:r_tgt}
+\end{equation}
+
+\paragraph{Boundary penalty.}
+Using $d_{\mathrm{b},i}^{(t)}$ defined in~\eqref{eq:safety}, the penalty is
+\begin{equation}
+  r_{\mathrm{bnd}} =
+  \begin{cases}
+    -20 & d_{\mathrm{b}} \le r_{\mathrm{uav}}, \\[3pt]
+    -\varphi(d_{\mathrm{b}},\, r_{\mathrm{uav}})
+    & r_{\mathrm{uav}} < d_{\mathrm{b}} < r_{\mathrm{uav}} + \sigma, \\[3pt]
+    0 & \text{otherwise}.
+  \end{cases}
+  \label{eq:r_bnd}
+\end{equation}
 
 The total reward for each UAV is
 \begin{equation}
-  R_{\mathrm{UAV}} = r_1 + r_2 + r_3.
+  R_{\mathrm{UAV}} = r_{\mathrm{uav}} + r_{\mathrm{obs}}
+    + r_{\mathrm{tgt}} + r_{\mathrm{bnd}}.
   \label{eq:total_reward}
 \end{equation}
 

@@ -2,7 +2,7 @@
 
 ## A. 问题陈述 (Problem Statement)
 
-我们考虑由一架无人机、$M$ 个移动地面目标 $\mathcal{G} = \{G_1, \dots, G_M\}$ 和 $K$ 个动态障碍区域 $\mathcal{T} = \{T_1, \dots, T_K\}$ 组成的三维环境中的目标覆盖问题，目标和障碍区域统称为实体 $\mathcal{E} = \{\mathcal{G}, \mathcal{T}\}$。每个任务开始时，所有实体的位置均在有界任务区域内随机初始化。无人机具有固定的观测半径 $R_{\mathrm{obs}}$（最大感知范围）和覆盖半径 $R_{\mathrm{cov}}$（覆盖目标所需的最小接近距离）。**系统目标是在有限的时间范围 $T_{\max}$ 内最大化目标覆盖范围，同时确保与所有障碍区域的避碰。**
+我们考虑由一架无人机、$M$ 个移动目标区域 $\mathcal{G} = \{G_1, \dots, G_M\}$ 和 $K$ 个动态障碍区域 $\mathcal{T} = \{T_1, \dots, T_K\}$ 组成的三维环境中的目标覆盖问题，目标区域和障碍区域统称为实体 $\mathcal{E} = \{\mathcal{G}, \mathcal{T}\}$。每个任务开始时，所有实体的位置均在有界任务区域内随机初始化。无人机具有固定的观测半径 $R_{\mathrm{obs}}$（最大感知范围）和覆盖半径 $R_{\mathrm{cov}}$（覆盖目标所需的最小接近距离）。**系统目标是在有限的时间范围 $T_{\max}$ 内最大化目标区域覆盖，同时确保与所有障碍区域的避碰。**
 
 ---
 
@@ -66,15 +66,17 @@ $$J = \sum_{t=0}^{T} \sum_{m=1}^{M} I_{\mathrm{cov}}(G_m, t)$$
 
 ### 动态实体
 
-每个目标 $G_m$ 被建模为半径 $r_{\mathrm{tgt}}$ 的圆柱体，位于固定高度 $z_{\mathrm{tgt}}$。目标在 $xy$ 平面上以恒定速度 $v_{\mathrm{tgt}}$ 移动，航向每 $T_{\mathrm{hold}}$ 个控制步从 $\mathcal{U}(0, 2\pi)$ 均匀重新采样。每个障碍区域 $T_k$ 为半径 $r_k \sim \mathcal{U}(r_{\min}^{\mathrm{obs}}, r_{\max}^{\mathrm{obs}})$ 的圆柱体，其中 $r_{\min}^{\mathrm{obs}}$ 和 $r_{\max}^{\mathrm{obs}}$ 分别为允许的最小和最大障碍半径。障碍区域在 $xy$ 平面上以速度 $v_{\mathrm{obs}}$ 移动，遵循与目标相同的随机航向协议。边界反射使所有实体保持在任务区域内。
+每个目标区域 $G_m$ 被建模为半径 $r_{\mathrm{tgt}}$ 的圆柱区域。目标区域在 $xy$ 平面上以恒定速度 $v_{\mathrm{tgt}}$ 移动，航向每 $T_{\mathrm{hold}}$ 个控制步从 $\mathcal{U}(0, 2\pi)$ 均匀重新采样。每个障碍区域 $T_k$ 为半径 $r_k \sim \mathcal{U}(r_{\min}^{\mathrm{obs}}, r_{\max}^{\mathrm{obs}})$ 的圆柱区域，其中 $r_{\min}^{\mathrm{obs}}$ 和 $r_{\max}^{\mathrm{obs}}$ 分别为允许的最小和最大障碍半径。障碍区域在 $xy$ 平面上以速度 $v_{\mathrm{obs}}$ 移动，遵循与目标区域相同的随机航向协议。边界反射使所有实体保持在任务区域内。
 
 ### 安全约束
 
-为避免碰撞，无人机必须与所有障碍区域边界保持安全距离。设 $\mathbf{p}_k^{(t)}$ 为障碍区域 $T_k$ 在时间 $t$ 的中心位置，$R_{\mathrm{safe}} = r_{\mathrm{uav}} + r_k$ 为最小安全间距。约束为：
+为避免碰撞并保持在任务区域内，无人机必须保持安全距离。设 $\mathbf{p}_k^{(t)}$ 为障碍区域 $T_k$ 在时间 $t$ 的中心位置。设 $R_{\mathrm{safe}}^{1} = r_{\mathrm{uav}} + r_k$ 为无人机与障碍区域边界之间的最小安全距离，$R_{\mathrm{safe}}^{2} = r_{\mathrm{uav}}$ 为无人机与任务区域边界之间的最小安全距离。约束为：
 
-$$\lVert\mathbf{p}^{(t)} - \mathbf{p}_k^{(t)}\rVert \ge R_{\mathrm{safe}}, \quad \forall\, T_k \in \mathcal{T}$$
+$$\begin{cases} \lVert\mathbf{p}^{(t)} - \mathbf{p}_k^{(t)}\rVert \ge R_{\mathrm{safe}}^{1}, & \forall\, T_k \in \mathcal{T} \\ d_{\mathrm{b}}^{(t)} \ge R_{\mathrm{safe}}^{2} \end{cases}$$
 
-此外，无人机周围存在宽度为 $d_{\mathrm{threat}}$ 的威胁区；当无人机与障碍区域边界的距离落入 $(R_{\mathrm{safe}},\, R_{\mathrm{safe}} + d_{\mathrm{threat}})$ 区间时，产生接近惩罚（见 C 节奖励函数）。
+其中 $d_{\mathrm{b}}^{(t)} = \min\!\bigl(\tfrac{L}{2} - |x^{(t)}|,\; \tfrac{L}{2} - |y^{(t)}|\bigr)$ 为无人机中心到任务区域边界的最小距离。
+
+
 
 ---
 
@@ -86,7 +88,7 @@ $$\lVert\mathbf{p}^{(t)} - \mathbf{p}_k^{(t)}\rVert \ge R_{\mathrm{safe}}, \quad
 
 在每个时间步 $t$，无人机接收局部观测 $o^{(t)}$，由三个部分组成：
 
-1. **自身状态** $[\mathbf{p}^{(t)},\, \mathbf{v}^{(t)}]$：无人机的位置和速度，分别按区域半径和最大速度归一化。
+1. **自身状态** $[\mathbf{p}^{(t)},\, \mathbf{v}^{(t)}]$：无人机的位置和速度，分别按区域半边长 $L/2$ 和最大速度 $v_{\max}$ 归一化。
 2. **目标状态** $[\mathbf{p}_m^{(t)} - \mathbf{p}^{(t)}]$，$m = 1,\dots,M$：每个目标相对于无人机的归一化相对位置。
 3. **障碍区域状态** $[\mathbf{p}_k^{(t)} - \mathbf{p}^{(t)},\, r_k]$，$k = 1,\dots,K$：每个障碍区域的相对位置和半径，半径按 $R_{\mathrm{obs}}$ 归一化。
 
@@ -98,20 +100,29 @@ $$\lVert\mathbf{p}^{(t)} - \mathbf{p}_k^{(t)}\rVert \ge R_{\mathrm{safe}}, \quad
 
 ### 奖励函数 (Reward Function)
 
-奖励函数分解为两个组成部分：障碍区域惩罚和覆盖奖励。
+奖励函数的设计借鉴了**人工势场**（APF）方法，将无人机接近危险区域时递增的排斥惩罚与引导其趋向目标的吸引奖励相结合。奖励分解为三个分量：障碍区域惩罚、目标奖励和边界惩罚。所有分量共享一个统一的势场核函数：
+
+$$\varphi(d,\,d_0) = \alpha\,\left(\frac{1}{d - d_0 + 1} - \frac{1}{\sigma + 1}\right)^{\!2}$$
+
+其中 $\alpha$ 为可调缩放系数，$d$ 为当前距离，$d_0$ 为发生硬碰撞的接触距离，$\sigma$ 为无人机的威胁区宽度。势函数 $\varphi$ 在 $d = d_0 + \sigma$ 处为零，并在 $d \to d_0$ 时单调递增。下文中下标 $xy$ 表示三维位置在 $xy$ 平面上的投影，如 $\mathbf{p}_{xy} = (x, y)^{\top}$。
 
 **1) 障碍区域惩罚：** 对于障碍区域 $T_k$（半径 $r_k$），无人机与障碍区域中心的平面距离为 $d = \lVert\mathbf{p}_{xy} - \mathbf{p}_{k,xy}\rVert$，其中 $\mathbf{p}_{xy}$ 和 $\mathbf{p}_{k,xy}$ 分别为无人机和障碍区域位置的 $xy$ 投影。设接触距离 $D_k = r_{\mathrm{uav}} + r_k$。惩罚为：
 
-$$r_1 = \begin{cases} -\alpha_{\mathrm{col}} & 0 \le d \le D_k \\ -\beta / \exp(d - D_k) & D_k < d < D_k + d_{\mathrm{threat}} \\ 0 & \text{其他} \end{cases}$$
+$$r_{\mathrm{obs}} = \begin{cases} -20 & d \le D_k \\ -\varphi(d,\, D_k) & D_k < d < D_k + \sigma \\ 0 & \text{其他} \end{cases}$$
 
-其中 $\alpha_{\mathrm{col}}$ 为无人机与障碍区域发生物理接触时的硬碰撞惩罚系数，$\beta$ 为随距离指数衰减的软威胁区惩罚系数，$d_{\mathrm{threat}}$ 为威胁区宽度。
+**2) 目标奖励：** 设 $d^{*} = \min_{m} \lVert\mathbf{p}_{xy} - \mathbf{p}_{m,xy}\rVert$ 为无人机到最近目标区域中心的平面距离，其中 $\mathbf{p}_{m,xy}$ 为目标区域 $G_m$ 位置的 $xy$ 投影。奖励为：
 
-**2) 覆盖奖励：** 每当无人机覆盖一个目标（即 $I_{\mathrm{cov}}(G_m, t) = 1$），获得正奖励 $r_2 = \alpha_{\mathrm{cov}}$，其中 $\alpha_{\mathrm{cov}}$ 为覆盖奖励系数。
+$$r_{\mathrm{tgt}} = \begin{cases} +10 & d^{*} \le R_{\mathrm{cov}} \\ \varphi(d^{*},\, R_{\mathrm{cov}}) & R_{\mathrm{cov}} < d^{*} < R_{\mathrm{cov}} + \sigma \\ 0 & \text{其他} \end{cases}$$
+
+**3) 边界惩罚：** 沿用安全约束中定义的 $d_{\mathrm{b}}^{(t)}$，惩罚为：
+
+$$r_{\mathrm{bnd}} = \begin{cases} -20 & d_{\mathrm{b}} \le r_{\mathrm{uav}} \\ -\varphi(d_{\mathrm{b}},\, r_{\mathrm{uav}}) & r_{\mathrm{uav}} < d_{\mathrm{b}} < r_{\mathrm{uav}} + \sigma \\ 0 & \text{其他} \end{cases}$$
 
 总奖励为：
 
-$$R = r_1 + r_2$$
+$$R = r_{\mathrm{obs}} + r_{\mathrm{tgt}} + r_{\mathrm{bnd}}$$
 
 ### 回合终止条件
 
-回合在以下条件下终止：(i) 累计捕获数达到 $\lceil \eta \cdot M \rceil$，其中 $\eta \in (0,1]$ 为覆盖完成比率；(ii) 安全约束被违反，即无人机与任一障碍区域发生碰撞；(iii) 回合时长超过最大时间范围 $T_{\max}$。
+回合在以下条件下终止：(i) 累计捕获数达到 $\lceil \eta \cdot M \rceil$，其中 $\eta \in (0,1]$ 为覆盖完成比率；(ii) 安全约束被违反；(iii) 回合时长超过最大时间范围 $T_{\max}$。
+

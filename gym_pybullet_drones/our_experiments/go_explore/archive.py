@@ -76,18 +76,20 @@ class Archive:
         gy = int(math.floor(world_xy[1] / self.cell_size))
         return (gx, gy)
 
-    def obs_to_cell_key(self, obs: Dict[str, np.ndarray]) -> Tuple[int, int, int]:
+    def obs_to_cell_key(
+        self, obs: Dict[str, np.ndarray], n_captured: int = 0,
+    ) -> Tuple[int, int, int]:
         """Return cell key for a single-agent observation dict.
 
         Key = (grid_x, grid_y, n_captured_targets).
-        The captured count is extracted from target_state: every 3rd element
-        starting at index 2 is a captured flag (0 or 1).
+
+        ``n_captured`` must be supplied externally (e.g. from
+        ``info["target_capture_count"]``) because the target observation
+        only contains relative positions — there is no captured flag.
         """
         self_state = np.asarray(obs["self_state"])
         gx, gy = self._xy_to_key(self_state[:2])
-        target_state = np.asarray(obs["target_state"])
-        n_captured = int(target_state[2::3].sum())
-        return (gx, gy, n_captured)
+        return (gx, gy, int(n_captured))
 
     def _cell_center(self, key: Tuple[int, int, int]) -> np.ndarray:
         """Return world-frame XY center (ignoring the capture-count dimension)."""
@@ -103,6 +105,7 @@ class Archive:
         trajectory_obs: List[Dict[str, np.ndarray]],
         trajectory_snapshots: List[dict],
         trajectory_rewards: List[float],
+        trajectory_n_captured: Optional[List[int]] = None,
     ) -> List[Cell]:
         """Process one trajectory and upsert cells.
 
@@ -114,17 +117,23 @@ class Archive:
             ``env.get_snapshot()`` result at each step.
         trajectory_rewards : list of float
             Scalar reward at each step.
+        trajectory_n_captured : list of int, optional
+            Cumulative target-capture count at each step (from env info).
+            If ``None``, the capture dimension of the cell key is always 0.
 
         Returns list of newly created cells.
         """
         new_cells: List[Cell] = []
         cum_reward = 0.0
+        if trajectory_n_captured is None:
+            trajectory_n_captured = [0] * len(trajectory_obs)
 
-        for step_idx, (obs, snapshot, reward) in enumerate(
-            zip(trajectory_obs, trajectory_snapshots, trajectory_rewards)
+        for step_idx, (obs, snapshot, reward, n_cap) in enumerate(
+            zip(trajectory_obs, trajectory_snapshots, trajectory_rewards,
+                trajectory_n_captured)
         ):
             cum_reward += reward
-            key = self.obs_to_cell_key(obs)
+            key = self.obs_to_cell_key(obs, n_captured=n_cap)
 
             if key not in self.cells:
                 if len(self.cells) >= self.max_cells:
