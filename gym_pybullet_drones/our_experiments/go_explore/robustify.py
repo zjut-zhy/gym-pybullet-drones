@@ -250,7 +250,7 @@ def train(cfg: RobustifyConfig) -> None:
                 obs, rew, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
 
-                rewards[e_idx] = float(rew)
+                rewards[e_idx] = float(np.clip(rew, -10.0, 10.0))
                 dones[e_idx] = float(done)
                 ep_rewards[e_idx] += float(rew)
 
