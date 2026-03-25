@@ -7,7 +7,7 @@ examples/test.py
 results/
 tmp/
 runs/
-gym_pybullet_drones/our_experiments/ra_l
+gym_pybullet_drones/our_experiments/ra_l/
 
 # Learning results
 experiments/learning/results/save-*
