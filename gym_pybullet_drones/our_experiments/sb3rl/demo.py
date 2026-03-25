@@ -15,12 +15,10 @@ Usage:
 
 import argparse
 import os
-import re
 import time
 
 import numpy as np
 from stable_baselines3 import PPO, SAC, TD3, DDPG
-from stable_baselines3.common.evaluation import evaluate_policy
 
 from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
@@ -31,8 +29,7 @@ DEFAULT_OBS = ObservationType("kin")
 DEFAULT_ACT = ActionType("vel")
 DEFAULT_VISUALIZE_COVERAGE = True
 DEFAULT_RECORD_VIDEO = False
-DEFAULT_N_EPISODES = 3
-DEFAULT_N_EVAL_EPISODES = 5
+DEFAULT_N_EPISODES = 5
 
 ALGO_MAP = {
     "ppo": PPO,
@@ -77,8 +74,6 @@ def run(
     record_video: bool = DEFAULT_RECORD_VIDEO,
     visualize_coverage: bool = DEFAULT_VISUALIZE_COVERAGE,
     n_episodes: int = DEFAULT_N_EPISODES,
-    n_eval_episodes: int = DEFAULT_N_EVAL_EPISODES,
-    eval_only: bool = False,
 ):
     # ── Resolve model path ────────────────────────────────────────
     model_file = _resolve_model_path(model_path)
@@ -105,17 +100,6 @@ def run(
     model = AlgoCls.load(model_file)
     print(f"[INFO] Model loaded successfully.")
 
-    # ── Quantitative evaluation (no GUI) ──────────────────────────
-    print(f"\n[INFO] Running quantitative evaluation ({n_eval_episodes} episodes, no GUI) ...")
-    eval_env = OurSingleRLAviary(obs=DEFAULT_OBS, act=DEFAULT_ACT, gui=False, record=False)
-    mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=n_eval_episodes, deterministic=True)
-    print(f"[RESULT] Mean reward = {mean_reward:.2f} ± {std_reward:.2f}")
-    eval_env.close()
-
-    if eval_only:
-        print("[INFO] --eval_only specified, skipping GUI demo.")
-        return
-
     # ── GUI demo ──────────────────────────────────────────────────
     print(f"\n[INFO] Launching GUI demo ({n_episodes} episode(s)) ...")
     test_env = OurSingleRLAviary(
@@ -127,10 +111,10 @@ def run(
     )
 
     for ep in range(n_episodes):
-        obs, info = test_env.reset()
+        ep_seed = np.random.randint(0, 2**31)
+        obs, info = test_env.reset(seed=ep_seed)
         start = time.time()
         ep_reward = 0.0
-        ep_captures = 0
         step_count = 0
         done = False
 
@@ -177,7 +161,7 @@ if __name__ == "__main__":
         epilog="""Examples:
   python -m gym_pybullet_drones.our_experiments.sb3rl.demo --model_path results/ppo-03.23.2026_19.34.20
   python -m gym_pybullet_drones.our_experiments.sb3rl.demo --algo sac --model_path results/sac-03.23.2026_20.35.11/best_model.zip
-  python -m gym_pybullet_drones.our_experiments.sb3rl.demo --model_path results/td3-03.24.2026_03.38.27 --n_episodes 5 --eval_only True
+  python -m gym_pybullet_drones.our_experiments.sb3rl.demo --model_path results/td3-03.24.2026_03.38.27 --n_episodes 5
 """,
     )
     p.add_argument(
@@ -193,20 +177,12 @@ if __name__ == "__main__":
         help=f"Number of GUI demo episodes (default: {DEFAULT_N_EPISODES})",
     )
     p.add_argument(
-        "--n_eval_episodes", type=int, default=DEFAULT_N_EVAL_EPISODES,
-        help=f"Number of quantitative eval episodes (default: {DEFAULT_N_EVAL_EPISODES})",
-    )
-    p.add_argument(
         "--record_video", type=str2bool, default=DEFAULT_RECORD_VIDEO,
         help="Record video during GUI demo",
     )
     p.add_argument(
         "--visualize_coverage", type=str2bool, default=DEFAULT_VISUALIZE_COVERAGE,
         help="Draw observation / threat / coverage rings in GUI",
-    )
-    p.add_argument(
-        "--eval_only", type=str2bool, default=False,
-        help="Only run quantitative evaluation (no GUI)",
     )
     args = p.parse_args()
     run(**vars(args))
