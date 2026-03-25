@@ -32,7 +32,7 @@ class PPOTrainer:
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.device = torch.device(device)
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
 
     def update(self, buffer: RolloutBuffer) -> Dict[str, float]:
         tot_pl, tot_vl, tot_ent, tot_loss, n = 0.0, 0.0, 0.0, 0.0, 0
@@ -41,13 +41,25 @@ class PPOTrainer:
                 new_lp, entropy, new_val = self.model.evaluate_actions(
                     batch["obs"], batch["action"], batch["gru_hidden"],
                 )
+
+                # --- NaN guard: skip bad batches to prevent poisoning ---
+                if torch.isnan(new_lp).any() or torch.isnan(new_val).any():
+                    continue
+
                 ratio = (new_lp - batch["old_log_prob"]).exp()
+                # Clamp ratio to prevent extreme updates
+                ratio = ratio.clamp(0.0, 10.0)
+
                 adv = batch["advantage"].unsqueeze(-1)
                 s1 = ratio * adv
                 s2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv
                 p_loss = -torch.min(s1, s2).mean()
                 v_loss = (new_val - batch["return"].unsqueeze(-1)).pow(2).mean()
                 loss = p_loss + self.vf_coef * v_loss - self.entropy_coef * entropy.mean()
+
+                # --- NaN guard on loss ---
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
 
                 self.optimizer.zero_grad()
                 loss.backward()

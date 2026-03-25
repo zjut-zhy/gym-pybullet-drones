@@ -12,10 +12,14 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+LOG_STD_MIN = -5.0
+LOG_STD_MAX = 0.5
+
 
 def _mlp(in_dim: int, hidden: int, out_dim: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Linear(in_dim, hidden),
+        nn.LayerNorm(hidden),
         nn.ReLU(inplace=True),
         nn.Linear(hidden, out_dim),
         nn.ReLU(inplace=True),
@@ -75,6 +79,10 @@ class ActorCritic(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         self.value_head = nn.Linear(gru_hidden, 1)
 
+    def _get_std(self) -> torch.Tensor:
+        """Clamped std to prevent divergence."""
+        return self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).exp()
+
     def initial_hidden(self, batch_size: int = 1) -> torch.Tensor:
         device = next(self.parameters()).device
         return torch.zeros(self.num_gru_layers, batch_size, self.gru_hidden, device=device)
@@ -90,10 +98,13 @@ class ActorCritic(nn.Module):
         gru_out = gru_out.squeeze(1)
 
         mean = self.policy_mean(gru_out)
-        std = self.log_std.exp().expand_as(mean)
+        std = self._get_std().expand_as(mean)
         dist = Normal(mean, std)
-        action = torch.tanh(dist.sample())
-        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
+        raw_action = dist.sample()
+        action = torch.tanh(raw_action)
+        # Correct log_prob for tanh squashing: log π(a) = log π(z) - Σ log(1 - tanh²(z))
+        log_prob = dist.log_prob(raw_action) - torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
         value = self.value_head(gru_out)
         return action, log_prob, value, new_hidden
 
@@ -108,9 +119,12 @@ class ActorCritic(nn.Module):
         gru_out = gru_out.squeeze(1)
 
         mean = self.policy_mean(gru_out)
-        std = self.log_std.exp().expand_as(mean)
+        std = self._get_std().expand_as(mean)
         dist = Normal(mean, std)
-        log_prob = dist.log_prob(actions).sum(dim=-1, keepdim=True)
+        # Inverse tanh to recover the pre-squash sample
+        raw_actions = torch.atanh(actions.clamp(-0.999, 0.999))
+        log_prob = dist.log_prob(raw_actions) - torch.log(1.0 - actions.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
         entropy = dist.entropy().sum(dim=-1, keepdim=True)
         value = self.value_head(gru_out)
         return log_prob, entropy, value
