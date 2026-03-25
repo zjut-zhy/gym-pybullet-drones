@@ -60,7 +60,7 @@ class OurSingleRLAviary(OurRLAviary):
         threat_zone_width_m: float = 1.5,
         max_episode_len_sec: float = 60.0,
         coverage_completion_ratio: float = 1.0,
-        visualize_coverage: bool = False,
+        visualize_coverage: bool = True,
     ):
         if num_drones != 1:
             raise ValueError(
