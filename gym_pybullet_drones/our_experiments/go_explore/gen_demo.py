@@ -1,18 +1,13 @@
-"""Go-Explore Bridge Layer -- tree-trace + deterministic replay demo.
+"""Go-Explore Bridge -- replay successful cells' action sequences to gen demos.
 
 Usage
 -----
     python -m gym_pybullet_drones.our_experiments.go_explore.gen_demo \\
         --archive_path results/go_explore/archive.json
 
-1. Load the Phase 1 archive.
-2. Find the best cell (most captures, then highest reward).
-3. Trace the parent-pointer tree back to root → reconstruct the full
-   action sequence.
-4. Replay that action sequence in a *deterministic* copy of the Phase 1
-   environment (same seed) to collect ``(obs, action, reward, snapshot)``
-   at every step.
-5. Save the result as ``.demo.pkl`` for Phase 2.
+Loads ALL successful cells (n_captured >= target_count) from the archive,
+replays each in a deterministic environment to collect per-step data, and
+saves them as .demo.pkl files for Phase 2.
 """
 
 from __future__ import annotations
@@ -26,7 +21,7 @@ import numpy as np
 from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
 
-from gym_pybullet_drones.our_experiments.go_explore.archive import Archive
+from gym_pybullet_drones.our_experiments.go_explore.archive import Archive, Cell
 from gym_pybullet_drones.our_experiments.go_explore.config import GoExploreConfig
 
 
@@ -45,62 +40,28 @@ def _make_env(cfg: GoExploreConfig, env_seed: int) -> OurSingleRLAviary:
     )
 
 
-def gen_demo(
-    archive_path: str,
-    output_path: str,
-    cfg: GoExploreConfig,
-) -> None:
-    # -- load archive --
-    archive = Archive()
-    archive.load(archive_path)
-    print(f"Loaded archive: {len(archive)} cells, env_seed={archive.env_seed}")
+def _replay_cell(env: OurSingleRLAviary, cell: Cell, env_seed: int) -> dict:
+    """Replay one cell's action sequence and collect per-step data."""
+    actions = cell.full_action_sequence
+    obs, _ = env.reset(seed=env_seed)
 
-    # -- find best cell (most captures → highest reward) --
-    best = archive.get_best_cell()
-    if best is None:
-        print("ERROR: empty archive.")
-        return
-    print(f"Best cell: key={best.key}, captures={best.key[2]}, "
-          f"reward={best.cumulative_reward:.2f}, "
-          f"cost={best.trajectory_cost}")
-
-    # -- tree-trace: reconstruct full action sequence --
-    full_actions = archive.reconstruct_trajectory(best.key)
-    print(f"Reconstructed trajectory: {len(full_actions)} actions "
-          f"(should match cost={best.trajectory_cost})")
-
-    if len(full_actions) == 0:
-        print("ERROR: empty trajectory (root cell with no actions).")
-        return
-
-    # -- deterministic replay --
-    print(f"Replaying in deterministic env (seed={archive.env_seed}) ...")
-    env = _make_env(cfg, env_seed=archive.env_seed)
-    obs, _ = env.reset()
-
-    demo_obs = []
-    demo_actions = []
-    demo_rewards = []
-    demo_snapshots = []
+    demo_obs, demo_actions, demo_rewards = [], [], []
     demo_n_captured = []
 
-    for i, action in enumerate(full_actions):
+    for i, action in enumerate(actions):
         obs, rew, terminated, truncated, info = env.step(action)
 
         demo_obs.append({k: np.array(v, copy=True) for k, v in obs.items()})
         demo_actions.append(np.array(action, copy=True))
         demo_rewards.append(float(rew))
-        demo_snapshots.append(env.get_snapshot())
         demo_n_captured.append(int(info.get("target_capture_count", 0)))
 
         if terminated or truncated:
-            print(f"  Episode ended at step {i+1} "
-                  f"({'terminated' if terminated else 'truncated'})")
+            if i + 1 < len(actions):
+                print(f"  WARNING: replay terminated at step {i+1}/{len(actions)}")
             break
 
-    env.close()
-
-    # -- compute MC returns --
+    # -- MC returns --
     gamma = 0.99
     rewards_arr = np.array(demo_rewards, dtype=np.float64)
     returns = np.zeros_like(rewards_arr)
@@ -109,40 +70,99 @@ def gen_demo(
         running = rewards_arr[t] + gamma * running
         returns[t] = running
 
-    total_reward = sum(demo_rewards)
-
-    # -- save demo --
-    demo = {
+    return {
         "obs_list": demo_obs,
         "action_list": demo_actions,
         "reward_list": demo_rewards,
-        "snapshot_list": demo_snapshots,
         "n_captured_list": demo_n_captured,
         "returns": returns.tolist(),
-        "total_reward": total_reward,
+        "total_reward": sum(demo_rewards),
         "n_steps": len(demo_obs),
-        "env_seed": archive.env_seed,
+        "max_captured": max(demo_n_captured) if demo_n_captured else 0,
+        "env_seed": env_seed,
+        "cell_key": list(cell.key),
     }
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        pickle.dump(demo, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    print(f"\nDemo saved to {output_path}")
-    print(f"  Steps       : {demo['n_steps']}")
-    print(f"  Total reward: {total_reward:.2f}")
-    print(f"  Return(t=0) : {returns[0]:.2f}")
-    print(f"  Final caps  : {demo_n_captured[-1] if demo_n_captured else 0}")
+def gen_demo(archive_path: str, output_path: str, cfg: GoExploreConfig) -> None:
+    archive = Archive()
+    archive.load(archive_path)
+    print(f"Loaded archive: {len(archive)} cells, env_seed={archive.env_seed}")
+
+    # Get all successful cells
+    successful = archive.get_successful_cells(cfg.target_count)
+    if not successful:
+        # Fallback: use best cell even if not fully successful
+        best = archive.get_best_cell()
+        if best is None:
+            print("ERROR: empty archive.")
+            return
+        successful = [best]
+        print(f"No fully successful cells found. Using best cell: "
+              f"key={best.key}, captures={best.key[2]}")
+    else:
+        print(f"Found {len(successful)} successful cells "
+              f"(n_captured >= {cfg.target_count})")
+
+    env = _make_env(cfg, env_seed=archive.env_seed)
+    all_demos = []
+
+    for idx, cell in enumerate(successful):
+        actions = cell.full_action_sequence
+        if actions is None or len(actions) == 0:
+            print(f"  [{idx}] Skipping cell {cell.key}: no action sequence")
+            continue
+
+        print(f"  [{idx}] Replaying cell key={cell.key}, "
+              f"captures={cell.key[2]}, seq={len(actions)} actions ...")
+        demo = _replay_cell(env, cell, archive.env_seed)
+        all_demos.append(demo)
+
+        print(f"       -> steps={demo['n_steps']}, "
+              f"captures={demo['max_captured']}, "
+              f"reward={demo['total_reward']:.2f}, "
+              f"return(t=0)={demo['returns'][0]:.2f}")
+
+    env.close()
+
+    if not all_demos:
+        print("ERROR: no valid demos generated.")
+        return
+
+    # Save individual demos + combined multi-demo file
+    out_dir = Path(output_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Combined file with all demos
+    combined = {
+        "demos": all_demos,
+        "n_demos": len(all_demos),
+        "env_seed": archive.env_seed,
+        "target_count": cfg.target_count,
+    }
+    with open(output_path, "wb") as f:
+        pickle.dump(combined, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # Also save the best single demo for backward compatibility
+    best_demo_path = str(Path(output_path).with_suffix("")) + "_best.demo.pkl"
+    with open(best_demo_path, "wb") as f:
+        pickle.dump(all_demos[0], f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"\n{'='*50}")
+    print(f"Saved {len(all_demos)} demos to {output_path}")
+    print(f"Best single demo saved to {best_demo_path}")
+    print(f"  Best: steps={all_demos[0]['n_steps']}, "
+          f"captures={all_demos[0]['max_captured']}, "
+          f"reward={all_demos[0]['total_reward']:.2f}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Go-Explore: extract demo via tree-trace + replay")
+        description="Go-Explore: gen demos from successful cells")
     parser.add_argument("--archive_path", type=str,
                         default="results/go_explore/archive.json")
     parser.add_argument("--output_path", type=str,
-                        default="results/go_explore/best_demo.demo.pkl")
-    # Environment params (must match Phase 1)
+                        default="results/go_explore/demos.pkl")
     parser.add_argument("--arena_size", type=float, default=10.0)
     parser.add_argument("--target_count", type=int, default=18)
     parser.add_argument("--obstacle_count", type=int, default=6)
@@ -162,3 +182,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

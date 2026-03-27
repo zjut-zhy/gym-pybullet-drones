@@ -17,6 +17,7 @@ import torch
 
 from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
+from gym_pybullet_drones.utils.utils import sync
 
 from gym_pybullet_drones.our_experiments.go_explore.networks import (
     ActorCritic, ObsEncoder,
@@ -63,6 +64,7 @@ def run(
         ep_reward = 0.0
         step_count = 0
         done = False
+        start = time.time()
 
         while not done:
             obs_t = {k: torch.as_tensor(np.array(v, dtype=np.float32),
@@ -74,7 +76,7 @@ def run(
             done = terminated or truncated
             ep_reward += float(rew)
             step_count += 1
-            time.sleep(1.0 / 30)
+            sync(step_count, start, 1.0 / env.CTRL_FREQ)
 
         captures = int(info.get("target_capture_count", 0))
         print(f"[Episode {ep+1}/{n_episodes}]  "

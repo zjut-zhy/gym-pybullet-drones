@@ -112,7 +112,7 @@ def run(
 
     for ep in range(n_episodes):
         ep_seed = np.random.randint(0, 2**31)
-        obs, info = test_env.reset(seed=ep_seed)
+        obs, info = test_env.reset(seed=0)
         start = time.time()
         ep_reward = 0.0
         step_count = 0
@@ -139,13 +139,13 @@ def run(
                     f"coverage={coverage:.3f}  captures={captures}"
                 )
 
-            test_env.render()
+            # test_env.render()
             sync(step_count - 1, start, test_env.CTRL_TIMESTEP)
 
         ep_captures = info.get("target_capture_count", 0)
         ep_coverage = info.get("coverage_ratio", 0.0)
         print(f"\n  Episode {ep + 1} finished: "
-              f"total_reward={ep_reward:+.2f}  "
+              f"total_reward={ep_reward:+.4f}  "
               f"steps={step_count}  "
               f"captures={ep_captures}  "
               f"coverage={ep_coverage:.3f}")

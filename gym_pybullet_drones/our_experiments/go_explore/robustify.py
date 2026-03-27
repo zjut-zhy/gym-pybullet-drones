@@ -154,17 +154,22 @@ def _restore_to_waypoint(
     demo: dict,
     start_idx: int,
 ) -> Dict[str, np.ndarray]:
-    """Restore env to demo waypoint ``start_idx``.
+    """Restore env to demo waypoint ``start_idx`` via action replay.
 
-    If start_idx == 0, does a fresh reset instead.
+    Deterministically replays the first ``start_idx`` actions from the demo
+    after a fresh ``reset(seed)`` to reproduce the exact physics state.
+    If start_idx == 0, does a fresh reset with the demo's fixed seed.
     """
+    seed = demo.get("env_seed", None)
+    obs, _ = env.reset(seed=seed)
     if start_idx <= 0:
-        obs, _ = env.reset()
         return obs
     # Clamp to valid range
-    idx = min(start_idx, len(demo["snapshot_list"]) - 1)
-    env.restore_snapshot(demo["snapshot_list"][idx])
-    obs = env._computeObs()
+    idx = min(start_idx, len(demo["action_list"]))
+    for action in demo["action_list"][:idx]:
+        obs, _, terminated, truncated, _ = env.step(action)
+        if terminated or truncated:
+            break
     return obs
 
 

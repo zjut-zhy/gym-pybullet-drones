@@ -1,97 +1,64 @@
-"""Archive for Go-Explore Phase 1 -- tree-structured cell database.
+"""Archive for Go-Explore Phase 1.
 
-Each cell stores a **parent pointer** and the **action segment** from
-parent to self.  To reconstruct the full trajectory to any cell, trace
-the parent chain back to the root and concatenate the action segments
-in reverse order -- the "linked-list tree tracing" approach.
+Each cell stores a **full_action_sequence**: the complete action list from
+``env.reset()`` to this cell, recorded at creation time.  Independent of
+other cells.
 
-The archive also stores the environment seed so that ``gen_demo`` can
-replay the reconstructed action sequence in an identical deterministic
-environment.
+When cell B is discovered from cell A at exploration step k:
+    B.full_action_sequence = A.full_action_sequence + actions[0:k+1]
+
+This is an independent copy.  Cells are "frozen" after creation (action
+sequence is never updated), so each cell's sequence is always valid for
+deterministic replay.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 import os
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 
-# -----------------------------------------------------------------------
-#  Cell dataclass
-# -----------------------------------------------------------------------
-
 @dataclass
 class Cell:
-    """One node in the exploration tree.
+    """One entry in the archive."""
 
-    Attributes
-    ----------
-    key : (gx, gy, n_captured)
-        Unique cell identifier.
-    center_xy : np.ndarray
-        Cell centre in world coordinates.
-    snapshot : dict or None
-        ``env.get_snapshot()`` for restoring during Phase 1 exploration.
-    trajectory_cost : int
-        Total steps from root to reach this cell (accumulated across the
-        parent chain).
-    cumulative_reward : float
-        Total reward from root to this cell.
-    visit_count, score : int, float
-        Cell visitation statistics for exploration sampling.
-    parent_key : tuple or None
-        Key of the cell we explored *from* to discover this cell.
-        ``None`` means this cell was reached from a fresh ``env.reset()``.
-    actions_from_parent : list[np.ndarray] or None
-        The action sequence executed from the parent cell's snapshot
-        (or from reset) that led to this cell.  Together with the parent
-        chain, these segments concatenate into the full trajectory.
-    """
-
-    key: Tuple[int, int, int]
+    key: Tuple[int, int, int]                    # (gx, gy, n_captured)
     center_xy: np.ndarray
-    snapshot: Optional[dict] = None
-    trajectory_cost: int = 0
+    trajectory_cost: int = 0                      # total steps from reset
     cumulative_reward: float = 0.0
     visit_count: int = 0
     score: float = 1.0
 
-    # ── tree structure ──
-    parent_key: Optional[Tuple[int, int, int]] = None
-    actions_from_parent: Optional[List[np.ndarray]] = None
+    # Complete action sequence from env.reset() to this cell.
+    # Each cell owns an independent copy; not affected by other cells.
+    full_action_sequence: Optional[List[np.ndarray]] = None
 
-    def update_score(self) -> None:
+    def update_score(self, max_steps: int = 1800,
+                     target_count: int = 18) -> None:
         novelty = 1.0 / (1.0 + self.visit_count)
-        reward_bonus = max(0.0, self.cumulative_reward)
-        self.score = novelty + 0.1 * reward_bonus
+        n_captured = self.key[2]
+        # Capture efficiency: normalised so perfect efficiency ≈ 1.0.
+        #   raw  = n_captured / trajectory_cost   (captures per step)
+        #   coef = max_steps / target_count        (scaling factor)
+        # A cell that captures all targets at uniform rate gets ~1.0.
+        coef = max_steps / max(1, target_count)
+        efficiency = (n_captured / max(1, self.trajectory_cost)) * coef
+        self.score = novelty + efficiency
 
-
-# -----------------------------------------------------------------------
-#  Archive
-# -----------------------------------------------------------------------
 
 class Archive:
-    """Cell archive with snapshot-based return + tree-structured
-    trajectory reconstruction.
+    """Cell archive with per-cell full action sequences.
 
     Parameters
     ----------
-    cell_size : float
-        Grid cell side-length in metres.
-    arena_half : float
-        Half-arena side-length; used for coordinate un-normalisation.
-    max_cells : int
-        Hard cap on the number of stored cells.
-    env_seed : int
-        Environment seed used in Phase 1 (stored for gen_demo replay).
+    cell_size, arena_half, max_cells, env_seed, max_steps : see Phase 1 config.
     """
 
     def __init__(
@@ -100,11 +67,15 @@ class Archive:
         arena_half: float = 5.0,
         max_cells: int = 10_000,
         env_seed: int = 42,
+        max_steps: int = 1800,
+        target_count: int = 18,
     ) -> None:
         self.cell_size = cell_size
         self.arena_half = arena_half
         self.max_cells = max_cells
         self.env_seed = env_seed
+        self.max_steps = max_steps
+        self.target_count = target_count
         self.cells: Dict[Tuple[int, int, int], Cell] = {}
         self._rng = np.random.RandomState(0)
 
@@ -133,122 +104,107 @@ class Archive:
             dtype=np.float32,
         )
 
-    # ── update (one exploration trajectory) ──
+    # ── update ──
 
     def update(
         self,
         trajectory_obs: List[Dict[str, np.ndarray]],
-        trajectory_snapshots: List[dict],
         trajectory_rewards: List[float],
         trajectory_actions: List[np.ndarray],
         trajectory_n_captured: Optional[List[int]] = None,
-        source_cell_key: Optional[Tuple[int, int, int]] = None,
-        source_cum_reward: float = 0.0,
-        source_cost: int = 0,
+        source_cell: Optional["Cell"] = None,
     ) -> List[Cell]:
-        """Process one Go-Explore trajectory and upsert cells.
+        """Process one exploration trajectory and upsert cells.
 
         Parameters
         ----------
-        trajectory_obs, trajectory_snapshots, trajectory_rewards,
-        trajectory_actions : per-step data from the exploration.
-        trajectory_n_captured : per-step target capture count.
-        source_cell_key : key of the cell we explored *from*.
-            ``None`` means we started from ``env.reset()``.
-        source_cum_reward : cumulative reward of the source cell
-            (so we can compute the total from root for each new cell).
-        source_cost : trajectory_cost of the source cell.
+        trajectory_* : per-step data from the exploration.
+        source_cell : the Cell we explored from (None = fresh reset).
+            Used to build each new cell's full_action_sequence.
         """
         new_cells: List[Cell] = []
-        cum_reward = source_cum_reward
         if trajectory_n_captured is None:
             trajectory_n_captured = [0] * len(trajectory_obs)
 
-        for step_idx, (obs, snapshot, reward, action, n_cap) in enumerate(
-            zip(trajectory_obs, trajectory_snapshots, trajectory_rewards,
+        # Prefix: the complete action history up to the source cell
+        prefix_actions: List[np.ndarray] = []
+        source_cum_reward = 0.0
+        source_cost = 0
+        if source_cell is not None:
+            if source_cell.full_action_sequence is not None:
+                prefix_actions = source_cell.full_action_sequence
+            source_cum_reward = source_cell.cumulative_reward
+            source_cost = source_cell.trajectory_cost
+
+        cum_reward = source_cum_reward
+
+        for step_idx, (obs, reward, action, n_cap) in enumerate(
+            zip(trajectory_obs, trajectory_rewards,
                 trajectory_actions, trajectory_n_captured)
         ):
             cum_reward += reward
             total_cost = source_cost + step_idx + 1
             key = self.obs_to_cell_key(obs, n_captured=n_cap)
 
-            # Actions from the source cell to this step (inclusive)
-            seg_actions = [np.array(a, copy=True)
-                           for a in trajectory_actions[: step_idx + 1]]
-
             if key not in self.cells:
                 if len(self.cells) >= self.max_cells:
                     continue
+                # Lazy build: only construct full_seq when actually needed
+                full_seq = prefix_actions + trajectory_actions[: step_idx + 1]
                 cell = Cell(
                     key=key,
                     center_xy=self._cell_center(key),
-                    snapshot=copy.deepcopy(snapshot),
                     trajectory_cost=total_cost,
                     cumulative_reward=cum_reward,
                     visit_count=1,
-                    parent_key=source_cell_key,
-                    actions_from_parent=seg_actions,
+                    full_action_sequence=full_seq,
                 )
-                cell.update_score()
+                cell.update_score(self.max_steps, self.target_count)
                 self.cells[key] = cell
                 new_cells.append(cell)
             else:
                 existing = self.cells[key]
                 existing.visit_count += 1
-                # Pareto dominance: update only if strictly better
-                if (total_cost <= existing.trajectory_cost
-                        and cum_reward >= existing.cumulative_reward
-                        and (total_cost < existing.trajectory_cost
-                             or cum_reward > existing.cumulative_reward)):
+                # Pure cost update: keep the shortest path to this cell.
+                # Cumulative reward is not used because shaping rewards
+                # (target_attraction) inflate reward for lingering
+                # trajectories, which is misleading under random actions.
+                if total_cost < existing.trajectory_cost:
+                    full_seq = prefix_actions + trajectory_actions[: step_idx + 1]
                     existing.trajectory_cost = total_cost
                     existing.cumulative_reward = cum_reward
-                    existing.snapshot = copy.deepcopy(snapshot)
-                    existing.parent_key = source_cell_key
-                    existing.actions_from_parent = seg_actions
-                existing.update_score()
+                    existing.full_action_sequence = full_seq
+                existing.update_score(self.max_steps, self.target_count)
 
         return new_cells
-
-    # ── tree reconstruction ──
-
-    def reconstruct_trajectory(
-        self, target_key: Tuple[int, int, int],
-    ) -> List[np.ndarray]:
-        """Trace parent pointers from *target_key* back to root.
-
-        Returns the full action sequence from ``env.reset()`` to the target
-        cell.  The segments are collected leaf-to-root and then reversed.
-        """
-        chain: List[List[np.ndarray]] = []
-        current = target_key
-
-        while current is not None:
-            cell = self.cells[current]
-            if cell.actions_from_parent:
-                chain.append(cell.actions_from_parent)
-            current = cell.parent_key
-
-        chain.reverse()
-        # Flatten into one continuous action list
-        return [a for segment in chain for a in segment]
 
     # ── best cell ──
 
     def get_best_cell(self) -> Optional[Cell]:
-        """Return the cell with the most target captures (then highest
-        cumulative reward as tie-breaker)."""
+        """Return cell with most captures (then fewest steps)."""
         if not self.cells:
             return None
         return max(self.cells.values(),
-                   key=lambda c: (c.key[2], c.cumulative_reward))
+                   key=lambda c: (c.key[2], -c.trajectory_cost))
+
+    def get_successful_cells(self, target_count: int) -> List[Cell]:
+        """Return all cells with n_captured >= target_count, sorted by fewest steps."""
+        successful = [
+            c for c in self.cells.values() if c.key[2] >= target_count
+        ]
+        successful.sort(key=lambda c: c.trajectory_cost)
+        return successful
 
     # ── selection ──
 
     def select(self) -> Optional[Cell]:
-        """Score-proportional sampling."""
         if not self.cells:
             return None
-        keys = list(self.cells.keys())
+        # Exclude done cells (all targets captured) — replaying them would
+        # immediately terminate the env, wasting the iteration.
+        keys = [k for k in self.cells if k[2] < self.target_count]
+        if not keys:
+            return None
         scores = np.array([self.cells[k].score for k in keys],
                           dtype=np.float64)
         total = scores.sum()
@@ -259,23 +215,19 @@ class Archive:
     # ── persistence ──
 
     def save(self, path: str) -> None:
-        """Save archive: JSON metadata + per-cell pickle files."""
         base = Path(path)
         base.parent.mkdir(parents=True, exist_ok=True)
-        cell_data_dir = base.parent / "cell_data"
-        cell_data_dir.mkdir(parents=True, exist_ok=True)
+        action_seq_dir = base.parent / "action_sequences"
+        action_seq_dir.mkdir(parents=True, exist_ok=True)
 
         meta = []
         for i, cell in enumerate(self.cells.values()):
-            # Pack snapshot + actions_from_parent into one pickle
-            cell_file = str(cell_data_dir / f"cell_{i}.pkl")
-            cell_payload = {
-                "snapshot": cell.snapshot,
-                "actions_from_parent": cell.actions_from_parent,
-            }
-            with open(cell_file, "wb") as f:
-                pickle.dump(cell_payload, f,
-                            protocol=pickle.HIGHEST_PROTOCOL)
+            # Save this cell's full action sequence
+            seq_file = str(action_seq_dir / f"cell_{i}_actions.pkl")
+            if cell.full_action_sequence is not None:
+                with open(seq_file, "wb") as f:
+                    pickle.dump(cell.full_action_sequence, f,
+                                protocol=pickle.HIGHEST_PROTOCOL)
 
             meta.append({
                 "key": list(cell.key),
@@ -284,10 +236,8 @@ class Archive:
                 "cumulative_reward": float(cell.cumulative_reward),
                 "visit_count": cell.visit_count,
                 "score": float(cell.score),
-                "parent_key": list(cell.parent_key) if cell.parent_key else None,
-                "cell_file": cell_file,
+                "action_seq_file": seq_file if cell.full_action_sequence is not None else None,
             })
-
         with open(str(base), "w") as f:
             json.dump({
                 "cell_size": self.cell_size,
@@ -303,29 +253,22 @@ class Archive:
 
         for entry in raw["cells"]:
             key = tuple(entry["key"])
-            snapshot = None
-            actions_from_parent = None
 
-            cell_file = entry.get("cell_file")
-            if cell_file and os.path.exists(cell_file):
-                with open(cell_file, "rb") as f:
-                    payload = pickle.load(f)
-                snapshot = payload.get("snapshot")
-                actions_from_parent = payload.get("actions_from_parent")
-
-            parent_key = (tuple(entry["parent_key"])
-                          if entry.get("parent_key") else None)
+            # Load this cell's full action sequence
+            full_action_sequence = None
+            seq_file = entry.get("action_seq_file")
+            if seq_file and os.path.exists(seq_file):
+                with open(seq_file, "rb") as f:
+                    full_action_sequence = pickle.load(f)
 
             cell = Cell(
                 key=key,
                 center_xy=np.array(entry["center_xy"], dtype=np.float32),
-                snapshot=snapshot,
                 trajectory_cost=entry["trajectory_cost"],
                 cumulative_reward=entry["cumulative_reward"],
                 visit_count=entry["visit_count"],
                 score=entry["score"],
-                parent_key=parent_key,
-                actions_from_parent=actions_from_parent,
+                full_action_sequence=full_action_sequence,
             )
             self.cells[key] = cell
 
