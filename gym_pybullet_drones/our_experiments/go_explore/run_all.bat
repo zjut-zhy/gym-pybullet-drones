@@ -4,9 +4,8 @@ set ENV=drones
 set OUT1=results\go_explore
 set OUT2=results\go_explore_phase2
 set ITERS1=20000
-set ENVS1=4
-set ITERS2=10000
-set ENVS2=4
+set ENVS1=1
+set TIMESTEPS2=1000000
 
 call conda activate %ENV%
 if errorlevel 1 (
@@ -39,7 +38,7 @@ if errorlevel 1 (
 
 echo.
 echo [3/4] Phase 2: Robustification ...
-python -m gym_pybullet_drones.our_experiments.go_explore.robustify --demo_path %OUT1%\best_demo.demo.pkl --total_iterations %ITERS2% --n_envs %ENVS2% --output_dir %OUT2%
+python -m gym_pybullet_drones.our_experiments.go_explore.robustify --demo_path %OUT1%\best_demo.demo.pkl --total_timesteps %TIMESTEPS2% --output_dir %OUT2%
 if errorlevel 1 (
     echo [ERROR] Phase 2 failed
     pause

@@ -3,16 +3,18 @@
 Usage
 -----
     python -m gym_pybullet_drones.our_experiments.go_explore.robustify \\
-        --demo_path results/go_explore/best_demo.demo.pkl \\
-        --total_iterations 3000 --n_envs 4
+        --demo_path results/go_explore/demos_best.demo.pkl \\
+        --total_timesteps 1000000
 
-Implements the full Phase 2 mechanism from the original Go-Explore paper:
+Implements the full Phase 2 mechanism:
   1. Backward Algorithm: start training from near the end of the demo
      trajectory, gradually shifting the starting point backward toward t=0.
   2. PPO: online policy gradient with clipped surrogate objective.
   3. SIL: self-imitation learning from demo + high-return online trajectories.
+  4. Alternating resets: backward waypoint (odd eps) / random seed (even eps).
 
-Adapted for single-agent OurSingleRLAviary.
+Adapted for single-agent OurSingleRLAviary.  Training loop, eval, and
+TensorBoard logging are aligned with sb3rl/train.py for fair comparison.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from gym_pybullet_drones.envs.OurSingleRLAviary import OurSingleRLAviary
 from gym_pybullet_drones.utils.enums import ActionType, ObservationType
@@ -52,11 +55,10 @@ class RobustifyConfig:
     ctrl_freq: int = 30
     max_episode_len_sec: float = 60.0
     action_dim: int = 2
-    n_envs: int = 4
 
-    # ── PPO ──────────────────────────────────────────────────────────
-    total_iterations: int = 500
-    policy_steps: int = 512
+    # ── PPO (aligned with sb3rl/train.py) ────────────────────────────
+    total_timesteps: int = 1_000_000
+    n_steps: int = 2048
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -76,7 +78,7 @@ class RobustifyConfig:
     backward_step_size: int = 50     # how many demo steps to shift backward
     success_threshold: float = 0.8   # success rate to trigger backward shift
     eval_window: int = 20            # number of recent episodes for success rate
-    max_backward_iters: int = 500    # max iters per backward level
+    max_backward_iters: int = 200    # max PPO updates per backward level
     success_captures: int = 18       # target captures needed for "success"
 
     # ── SIL ──────────────────────────────────────────────────────────
@@ -85,10 +87,13 @@ class RobustifyConfig:
     sil_capacity: int = 50_000
     sil_online_threshold: float = 0.0  # min ep reward to add to SIL buffer
 
+    # ── evaluation (aligned with sb3rl/train.py) ─────────────────────
+    eval_freq: int = 10_000          # evaluate every N env steps
+    n_eval_episodes: int = 3
+
     # ── demo / IO ────────────────────────────────────────────────────
-    demo_path: str = "results/go_explore/best_demo.demo.pkl"
-    log_interval: int = 10
-    save_interval: int = 100
+    demo_path: str = "results/go_explore/demos_best.demo.pkl"
+    log_interval: int = 100          # print every N PPO updates
     output_dir: str = "results/go_explore_phase2"
     seed: int = 42
     device: str = "cpu"
@@ -121,28 +126,20 @@ def _obs_keys_shapes(env: OurSingleRLAviary) -> Dict[str, tuple]:
     return {k: box.shape for k, box in env.observation_space.spaces.items()}
 
 
-def _stack_obs(
-    obs_list: List[Dict[str, np.ndarray]],
+def _obs_to_batch(
+    obs: Dict[str, np.ndarray],
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
-    keys = list(obs_list[0].keys())
-    out = {}
-    for key in keys:
-        arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
-        out[key] = torch.as_tensor(np.stack(arrs), dtype=torch.float32,
-                                   device=device)
-    return out
+    """Single obs dict → batch-of-1 tensors."""
+    return {
+        k: torch.as_tensor(v, dtype=torch.float32, device=device).unsqueeze(0)
+        for k, v in obs.items()
+    }
 
 
-def _stack_obs_np(
-    obs_list: List[Dict[str, np.ndarray]],
-) -> Dict[str, np.ndarray]:
-    keys = list(obs_list[0].keys())
-    out = {}
-    for key in keys:
-        arrs = [np.asarray(obs[key], dtype=np.float32) for obs in obs_list]
-        out[key] = np.stack(arrs)
-    return out
+def _obs_to_np_batch(obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Single obs dict → batch-of-1 numpy arrays."""
+    return {k: np.expand_dims(np.asarray(v, dtype=np.float32), 0) for k, v in obs.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -154,23 +151,66 @@ def _restore_to_waypoint(
     demo: dict,
     start_idx: int,
 ) -> Dict[str, np.ndarray]:
-    """Restore env to demo waypoint ``start_idx`` via action replay.
-
-    Deterministically replays the first ``start_idx`` actions from the demo
-    after a fresh ``reset(seed)`` to reproduce the exact physics state.
-    If start_idx == 0, does a fresh reset with the demo's fixed seed.
-    """
+    """Restore env to demo waypoint ``start_idx`` via action replay."""
     seed = demo.get("env_seed", None)
     obs, _ = env.reset(seed=seed)
     if start_idx <= 0:
         return obs
-    # Clamp to valid range
     idx = min(start_idx, len(demo["action_list"]))
     for action in demo["action_list"][:idx]:
         obs, _, terminated, truncated, _ = env.step(action)
         if terminated or truncated:
             break
     return obs
+
+
+# ---------------------------------------------------------------------------
+#  Evaluation
+# ---------------------------------------------------------------------------
+
+def _evaluate(
+    model: ActorCritic,
+    cfg: RobustifyConfig,
+    device: torch.device,
+    n_episodes: int = 3,
+) -> dict:
+    """Run evaluation episodes with random seeds, return stats."""
+    model.eval()
+    ep_rewards, ep_lengths, ep_captures = [], [], []
+
+    eval_env = _make_env(cfg, env_seed=cfg.seed + 9999)
+
+    for ep in range(n_episodes):
+        ep_seed = np.random.randint(0, 2**31)
+        obs, _ = eval_env.reset(seed=ep_seed)
+        hidden = model.initial_hidden(1).to(device)
+        total_rew = 0.0
+        steps = 0
+        captures = 0
+
+        while True:
+            obs_batch = _obs_to_batch(obs, device)
+            with torch.no_grad():
+                action_t, _, _, hidden = model.get_action(obs_batch, hidden)
+            action = action_t.cpu().numpy()[0]
+            obs, rew, terminated, truncated, info = eval_env.step(action)
+            total_rew += float(rew)
+            steps += 1
+            captures = int(info.get("target_capture_count", 0))
+            if terminated or truncated:
+                break
+
+        ep_rewards.append(total_rew)
+        ep_lengths.append(steps)
+        ep_captures.append(captures)
+
+    eval_env.close()
+    return {
+        "mean_reward": float(np.mean(ep_rewards)),
+        "std_reward": float(np.std(ep_rewards)),
+        "mean_length": float(np.mean(ep_lengths)),
+        "mean_captures": float(np.mean(ep_captures)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +222,6 @@ def train(cfg: RobustifyConfig) -> None:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    n_envs = cfg.n_envs
-    n_batch = n_envs  # single agent per env
-
     # -- load demo --
     with open(cfg.demo_path, "rb") as f:
         demo = pickle.load(f)
@@ -192,11 +229,11 @@ def train(cfg: RobustifyConfig) -> None:
     print(f"Loaded demo: {demo_n_steps} steps, "
           f"total_reward={demo['total_reward']:.2f}")
 
-    # -- environments --
-    envs = [_make_env(cfg, cfg.seed + i) for i in range(n_envs)]
+    # -- environment --
+    env = _make_env(cfg, env_seed=cfg.seed)
 
     # -- model --
-    obs_shapes = _obs_keys_shapes(envs[0])
+    obs_shapes = _obs_keys_shapes(env)
     encoder = ObsEncoder(
         self_state_dim=obs_shapes.get("self_state", (6,))[-1],
         target_state_dim=obs_shapes.get("target_state", (54,))[-1],
@@ -217,7 +254,7 @@ def train(cfg: RobustifyConfig) -> None:
     )
 
     buffer = RolloutBuffer(
-        n_steps=cfg.policy_steps, n_agents=n_batch,
+        n_steps=cfg.n_steps, n_agents=1,
         obs_keys_shapes=obs_shapes, action_dim=cfg.action_dim,
         gru_hidden=cfg.gru_hidden, num_gru_layers=cfg.num_gru_layers,
     )
@@ -231,124 +268,146 @@ def train(cfg: RobustifyConfig) -> None:
 
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
+    # -- TensorBoard --
+    tb_dir = os.path.join("runs", "go_explore_phase2")
+    writer = SummaryWriter(log_dir=tb_dir)
+
     # ================================================================
-    #  Backward Algorithm
+    #  Backward Algorithm State
     # ================================================================
-    # Start near the end of the demo trajectory and work backward
     start_idx = max(0, demo_n_steps - cfg.backward_step_size)
-    success_history: List[bool] = []  # sliding window for backward scheduling
+    success_history: List[bool] = []
+    episode_count = 0  # total episodes completed (for alternating reset)
 
     print("=" * 70)
     print("Go-Explore Phase 2 -- Robustification")
     print(f"  Backward algorithm: demo_steps={demo_n_steps}, "
           f"step_size={cfg.backward_step_size}")
     print(f"  PPO + SIL (sil_coef={cfg.sil_coef})")
-    print(f"  n_envs={n_envs}  policy_steps={cfg.policy_steps}")
+    print(f"  n_steps={cfg.n_steps}  total_timesteps={cfg.total_timesteps}")
+    print(f"  Eval: every {cfg.eval_freq} steps, {cfg.n_eval_episodes} eps")
+    print(f"  TensorBoard: {tb_dir}")
     print("=" * 70)
 
     global_step = 0
     t_start = time.time()
-    level_iters = 0
+    level_iters = 0        # PPO updates at current backward level
+    best_eval_reward = -float("inf")
+    next_eval_step = cfg.eval_freq
 
-    for iteration in range(1, cfg.total_iterations + 1):
+    # -- initial reset (backward waypoint) --
+    obs = _restore_to_waypoint(env, demo, start_idx)
+    hidden = model.initial_hidden(1).to(device)
+
+    # -- episode tracking --
+    ep_reward = 0.0
+    ep_length = 0
+    ep_captures = 0
+    ep_obs_buf: List[Dict[str, np.ndarray]] = []
+    ep_act_buf: List[np.ndarray] = []
+    ep_rew_buf: List[float] = []
+
+    update_count = 0
+
+    while global_step < cfg.total_timesteps:
         buffer.reset()
         model.eval()
 
-        # -- restore all envs to the current backward waypoint --
-        obs_list: List[Dict[str, np.ndarray]] = []
-        for env in envs:
-            obs = _restore_to_waypoint(env, demo, start_idx)
-            obs_list.append(obs)
-
-        hidden = model.initial_hidden(n_batch).to(device)
-        ep_rewards = [0.0] * n_envs
-        ep_captures = [0] * n_envs      # track captures per env
-
-        # -- collect per-env trajectories for potential SIL insertion --
-        ep_obs_buf: List[List[Dict[str, np.ndarray]]] = [[] for _ in range(n_envs)]
-        ep_act_buf: List[List[np.ndarray]] = [[] for _ in range(n_envs)]
-        ep_rew_buf: List[List[float]] = [[] for _ in range(n_envs)]
-
-        for step in range(cfg.policy_steps):
-            obs_batch = _stack_obs(obs_list, device)
-
+        # -- collect n_steps transitions --
+        for step in range(cfg.n_steps):
+            obs_batch = _obs_to_batch(obs, device)
             action_t, lp_t, val_t, hidden = model.get_action(obs_batch, hidden)
 
-            actions_np = action_t.cpu().numpy()
+            action_np = action_t.cpu().numpy()[0]
             lp_np = lp_t.cpu().numpy()
             val_np = val_t.cpu().numpy()
 
-            new_obs_list = []
-            rewards = np.zeros(n_batch, dtype=np.float32)
-            dones = np.zeros(n_batch, dtype=np.float32)
+            new_obs, rew, terminated, truncated, info = env.step(action_np)
+            done = terminated or truncated
+            ep_captures = int(info.get("target_capture_count", 0))
 
-            for e_idx, env in enumerate(envs):
-                action = actions_np[e_idx]
-                obs, rew, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                ep_captures[e_idx] = int(info.get("target_capture_count", 0))
+            clipped_rew = float(np.clip(rew, -10.0, 10.0))
+            ep_reward += float(rew)
+            ep_length += 1
 
-                rewards[e_idx] = float(np.clip(rew, -10.0, 10.0))
-                dones[e_idx] = float(done)
-                ep_rewards[e_idx] += float(rew)
+            # Track for SIL
+            ep_obs_buf.append({k: np.array(v, copy=True) for k, v in new_obs.items()})
+            ep_act_buf.append(np.array(action_np, copy=True))
+            ep_rew_buf.append(float(rew))
 
-                # Track for SIL
-                ep_obs_buf[e_idx].append(
-                    {k: np.array(v, copy=True) for k, v in obs.items()})
-                ep_act_buf[e_idx].append(np.array(action, copy=True))
-                ep_rew_buf[e_idx].append(float(rew))
-
-                new_obs_list.append(obs)
-
-                if done:
-                    # Add high-return episodes to SIL buffer
-                    ep_total = sum(ep_rew_buf[e_idx])
-                    if ep_total > cfg.sil_online_threshold:
-                        sil_buffer.add_trajectory(
-                            ep_obs_buf[e_idx], ep_act_buf[e_idx],
-                            ep_rew_buf[e_idx], gamma=cfg.gamma,
-                        )
-                    # Reset trajectory tracking
-                    ep_obs_buf[e_idx] = []
-                    ep_act_buf[e_idx] = []
-                    ep_rew_buf[e_idx] = []
-
-                    # Restore to current waypoint again
-                    rst_obs = _restore_to_waypoint(env, demo, start_idx)
-                    new_obs_list[-1] = rst_obs
-                    hidden[:, e_idx:e_idx + 1, :] = 0.0
-
-            buf_obs = _stack_obs_np(obs_list)
+            # Store in buffer (batch dim = 1)
+            buf_obs = _obs_to_np_batch(obs)
             buffer.add(
-                obs=buf_obs, action=actions_np, log_prob=lp_np,
-                reward=rewards, value=val_np, done=dones,
+                obs=buf_obs,
+                action=action_np[np.newaxis],
+                log_prob=lp_np,
+                reward=np.array([clipped_rew], dtype=np.float32),
+                value=val_np,
+                done=np.array([float(done)], dtype=np.float32),
                 gru_hidden=hidden.detach().cpu().numpy(),
             )
-            obs_list = new_obs_list
-            global_step += n_batch
 
+            global_step += 1
+            obs = new_obs
+
+            if done:
+                # -- TensorBoard episode logging --
+                writer.add_scalar("rollout/ep_rew_mean", ep_reward, global_step)
+                writer.add_scalar("rollout/ep_len_mean", ep_length, global_step)
+                writer.add_scalar("rollout/ep_captures", ep_captures, global_step)
+
+                # -- SIL: add high-return episodes --
+                if sum(ep_rew_buf) > cfg.sil_online_threshold:
+                    sil_buffer.add_trajectory(
+                        ep_obs_buf, ep_act_buf, ep_rew_buf, gamma=cfg.gamma,
+                    )
+
+                # -- backward success tracking --
+                success_history.append(ep_captures >= cfg.success_captures)
+                if len(success_history) > cfg.eval_window:
+                    success_history = success_history[-cfg.eval_window:]
+
+                # -- alternating reset --
+                episode_count += 1
+                if episode_count % 2 == 0:
+                    # Even episode: random seed reset (generalization)
+                    rand_seed = np.random.randint(0, 2**31)
+                    obs, _ = env.reset(seed=rand_seed)
+                else:
+                    # Odd episode: backward waypoint (curriculum)
+                    obs = _restore_to_waypoint(env, demo, start_idx)
+
+                hidden = model.initial_hidden(1).to(device)
+                ep_reward = 0.0
+                ep_length = 0
+                ep_captures = 0
+                ep_obs_buf = []
+                ep_act_buf = []
+                ep_rew_buf = []
+
+        # -- compute GAE returns --
         with torch.no_grad():
-            last_obs = _stack_obs(obs_list, device)
-            _, _, last_val, _ = model.get_action(last_obs, hidden)
+            last_obs_batch = _obs_to_batch(obs, device)
+            _, _, last_val, _ = model.get_action(last_obs_batch, hidden)
         buffer.compute_returns(last_val.cpu().numpy(), cfg.gamma, cfg.gae_lambda)
 
+        # -- PPO + SIL update --
         model.train()
         loss_info = ppo.update(buffer, sil_buffer=sil_buffer)
-
-        # -- track success for backward scheduling --
-        mean_rew = np.mean(ep_rewards)
-        # Success = all targets captured (per env)
-        for e_idx in range(n_envs):
-            success_history.append(ep_captures[e_idx] >= cfg.success_captures)
-        if len(success_history) > cfg.eval_window * n_envs:
-            success_history = success_history[-(cfg.eval_window * n_envs):]
-
+        update_count += 1
         level_iters += 1
 
-        # -- check backward shift condition --
+        # -- TensorBoard training logs --
+        writer.add_scalar("train/policy_loss", loss_info["policy_loss"], global_step)
+        writer.add_scalar("train/value_loss", loss_info["value_loss"], global_step)
+        writer.add_scalar("train/sil_loss", loss_info["sil_loss"], global_step)
+        writer.add_scalar("backward/start_idx", start_idx, global_step)
+        success_rate = float(np.mean(success_history)) if success_history else 0.0
+        writer.add_scalar("backward/success_rate", success_rate, global_step)
+
+        # -- backward shift check --
         shifted = False
         if level_iters >= cfg.eval_window:
-            success_rate = np.mean(success_history) if success_history else 0.0
             if (success_rate >= cfg.success_threshold
                     or level_iters >= cfg.max_backward_iters):
                 old_idx = start_idx
@@ -363,42 +422,54 @@ def train(cfg: RobustifyConfig) -> None:
                     print(f"\n  >> BACKWARD SHIFT: start_idx {old_idx} -> {start_idx}"
                           f"  ({reason})")
 
-        # -- logging --
-        if iteration % cfg.log_interval == 0 or iteration == 1 or shifted:
+        # -- console logging --
+        if update_count % cfg.log_interval == 0 or update_count == 1 or shifted:
             elapsed = time.time() - t_start
-            success_rate = np.mean(success_history) if success_history else 0.0
-            max_cap = max(ep_captures)
             print(
-                f"[iter {iteration:5d}]  "
+                f"[step {global_step:>8d}/{cfg.total_timesteps}]  "
+                f"updates={update_count:4d}  "
                 f"start={start_idx:4d}/{demo_n_steps}  "
                 f"succ={success_rate:.0%}  "
-                f"cap={max_cap}/{cfg.success_captures}  "
-                f"rew={mean_rew:+8.2f}  "
                 f"p={loss_info['policy_loss']:.4f}  "
                 f"v={loss_info['value_loss']:.4f}  "
                 f"sil={loss_info['sil_loss']:.4f}  "
                 f"sil_buf={len(sil_buffer)}  t={elapsed:.0f}s"
             )
 
-        if iteration % cfg.save_interval == 0:
-            ckpt = os.path.join(cfg.output_dir, f"model_iter{iteration}.pt")
-            torch.save(model.state_dict(), ckpt)
-            print(f"  -> saved {ckpt}")
+        # -- evaluation --
+        if global_step >= next_eval_step:
+            eval_stats = _evaluate(model, cfg, device, cfg.n_eval_episodes)
+            writer.add_scalar("eval/mean_reward", eval_stats["mean_reward"], global_step)
+            writer.add_scalar("eval/mean_length", eval_stats["mean_length"], global_step)
+            writer.add_scalar("eval/mean_captures", eval_stats["mean_captures"], global_step)
 
-        # Early stop: reached the beginning and converged
+            print(f"  [EVAL step={global_step}]  "
+                  f"reward={eval_stats['mean_reward']:+.2f} ± {eval_stats['std_reward']:.2f}  "
+                  f"captures={eval_stats['mean_captures']:.1f}")
+
+            # Save best model
+            if eval_stats["mean_reward"] > best_eval_reward:
+                best_eval_reward = eval_stats["mean_reward"]
+                torch.save(model.state_dict(),
+                           os.path.join(cfg.output_dir, "best_model.pt"))
+                print(f"  -> new best model (reward={best_eval_reward:+.2f})")
+
+            next_eval_step += cfg.eval_freq
+
+        # -- early stop: backward fully converged --
         if start_idx == 0 and level_iters >= cfg.eval_window:
-            final_success_rate = np.mean(success_history) if success_history else 0.0
-            if final_success_rate >= cfg.success_threshold:
+            if success_rate >= cfg.success_threshold:
                 print(f"\n  >> CONVERGED at start_idx=0, "
-                      f"success_rate={final_success_rate:.1%}")
+                      f"success_rate={success_rate:.1%}")
                 break
 
+    # -- final save --
     torch.save(model.state_dict(),
                os.path.join(cfg.output_dir, "model_final.pt"))
-    print(f"\nPhase 2 finished. Final start_idx={start_idx}")
-
-    for env in envs:
-        env.close()
+    writer.close()
+    env.close()
+    print(f"\nPhase 2 finished. total_steps={global_step}, "
+          f"final start_idx={start_idx}")
 
 
 def _parse_args() -> RobustifyConfig:
