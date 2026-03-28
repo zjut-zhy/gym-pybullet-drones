@@ -165,11 +165,15 @@ class Archive:
             else:
                 existing = self.cells[key]
                 existing.visit_count += 1
-                # Pure cost update: keep the shortest path to this cell.
-                # Cumulative reward is not used because shaping rewards
-                # (target_attraction) inflate reward for lingering
-                # trajectories, which is misleading under random actions.
-                if total_cost < existing.trajectory_cost:
+                # Pareto update: replace if new path is not worse on
+                # both (cost, reward) and strictly better on at least one.
+                # With target_attraction disabled in Phase 1, cumulative_reward
+                # only reflects capture bonuses + safety penalties.
+                cost_ok = total_cost <= existing.trajectory_cost
+                reward_ok = cum_reward >= existing.cumulative_reward
+                strictly_better = (total_cost < existing.trajectory_cost
+                                   or cum_reward > existing.cumulative_reward)
+                if cost_ok and reward_ok and strictly_better:
                     full_seq = prefix_actions + trajectory_actions[: step_idx + 1]
                     existing.trajectory_cost = total_cost
                     existing.cumulative_reward = cum_reward
@@ -181,18 +185,18 @@ class Archive:
     # ── best cell ──
 
     def get_best_cell(self) -> Optional[Cell]:
-        """Return cell with most captures (then fewest steps)."""
+        """Return cell with most captures (then highest reward)."""
         if not self.cells:
             return None
         return max(self.cells.values(),
-                   key=lambda c: (c.key[2], -c.trajectory_cost))
+                   key=lambda c: (c.key[2], c.cumulative_reward))
 
     def get_successful_cells(self, target_count: int) -> List[Cell]:
-        """Return all cells with n_captured >= target_count, sorted by fewest steps."""
+        """Return all cells with n_captured >= target_count, sorted by reward."""
         successful = [
             c for c in self.cells.values() if c.key[2] >= target_count
         ]
-        successful.sort(key=lambda c: c.trajectory_cost)
+        successful.sort(key=lambda c: c.cumulative_reward, reverse=True)
         return successful
 
     # ── selection ──

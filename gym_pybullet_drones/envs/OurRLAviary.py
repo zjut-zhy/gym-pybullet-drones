@@ -62,6 +62,7 @@ class OurRLAviary(BaseRLAviary):
         max_episode_len_sec: float = 60.0,
         coverage_completion_ratio: float = 1.0,
         visualize_coverage: bool = True,
+        enable_target_attraction: bool = True,
     ):
         if obs != ObservationType.KIN:
             raise ValueError("OurRLAviary currently supports ObservationType.KIN only")
@@ -109,6 +110,7 @@ class OurRLAviary(BaseRLAviary):
         self.VIS_COVERAGE = bool(visualize_coverage)
         self.VEL_Z_COMPONENT = 0.0
         self.VEL_SPEED_SCALE = 1.0
+        self.ENABLE_TARGET_ATTRACTION = bool(enable_target_attraction)
 
         if act == ActionType.VEL:
             self.ACTION_DIM = 2
@@ -460,7 +462,9 @@ class OurRLAviary(BaseRLAviary):
                 radii = np.asarray(extra_radii, dtype=np.float32).reshape(-1)
             candidates.append((points, radii))
         drone_points = np.asarray(drone_xy, dtype=np.float32).reshape(-1, 2)
-        drone_radii = np.full((drone_points.shape[0],), self.UAV_RADIUS_M, dtype=np.float32)
+        # Use observation radius so spawned entities never appear inside
+        # any drone's field of view (avoids targets popping into existence).
+        drone_radii = np.full((drone_points.shape[0],), self.OBSERVATION_RADIUS_M, dtype=np.float32)
         candidates.append((drone_points, drone_radii))
 
         for _ in range(5000):
@@ -817,15 +821,16 @@ class OurRLAviary(BaseRLAviary):
         if self._last_drone_captures is not None:
             rewards += 10.0 * self._last_drone_captures.astype(np.float32)
 
-        # 目标吸引力：每个无人机对最近目标的 APF 引导奖励
-        for drone_idx in range(self.NUM_DRONES):
-            drone_pos = self.pos[drone_idx, :2]
-            min_dist = float('inf')
-            for target_idx in range(self.TARGET_COUNT):
-                dist = float(np.linalg.norm(drone_pos - self._target_positions[target_idx, :2]))
-                if dist < min_dist:
-                    min_dist = dist
-            rewards[drone_idx] += self._target_attraction(min_dist)
+        # Target attraction (optional shaping reward)
+        if self.ENABLE_TARGET_ATTRACTION:
+            for drone_idx in range(self.NUM_DRONES):
+                drone_pos = self.pos[drone_idx, :2]
+                min_dist = float('inf')
+                for target_idx in range(self.TARGET_COUNT):
+                    dist = float(np.linalg.norm(drone_pos - self._target_positions[target_idx, :2]))
+                    if dist < min_dist:
+                        min_dist = dist
+                rewards[drone_idx] += self._target_attraction(min_dist)
 
         # UAV 碰撞惩罚：双方各承担一半
         for i in range(self.NUM_DRONES - 1):
@@ -895,7 +900,9 @@ class OurRLAviary(BaseRLAviary):
     ################################################################################
 
     def _computeTruncated(self):
-        if np.any(np.abs(self.rpy[:, 0]) > 1.0) or np.any(np.abs(self.rpy[:, 1]) > 1.0):
+        # Truncate if roll or pitch exceeds ±45°
+        attitude_limit = np.pi / 4  # 45°
+        if np.any(np.abs(self.rpy[:, 0]) > attitude_limit) or np.any(np.abs(self.rpy[:, 1]) > attitude_limit):
             return True
         return bool(self.step_counter / self.PYB_FREQ > self.EPISODE_LEN_SEC)
 

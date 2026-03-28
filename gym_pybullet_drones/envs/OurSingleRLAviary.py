@@ -61,6 +61,7 @@ class OurSingleRLAviary(OurRLAviary):
         max_episode_len_sec: float = 60.0,
         coverage_completion_ratio: float = 1.0,
         visualize_coverage: bool = True,
+        enable_target_attraction: bool = True,
     ):
         if num_drones != 1:
             raise ValueError(
@@ -95,6 +96,7 @@ class OurSingleRLAviary(OurRLAviary):
             max_episode_len_sec=max_episode_len_sec,
             coverage_completion_ratio=coverage_completion_ratio,
             visualize_coverage=visualize_coverage,
+            enable_target_attraction=enable_target_attraction,
         )
 
     # ------------------------------------------------------------------

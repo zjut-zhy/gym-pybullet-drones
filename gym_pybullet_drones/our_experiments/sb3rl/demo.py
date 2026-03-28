@@ -112,7 +112,7 @@ def run(
 
     for ep in range(n_episodes):
         ep_seed = np.random.randint(0, 2**31)
-        obs, info = test_env.reset(seed=0)
+        obs, info = test_env.reset(seed=ep_seed)
         start = time.time()
         ep_reward = 0.0
         step_count = 0

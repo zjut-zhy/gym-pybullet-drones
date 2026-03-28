@@ -55,8 +55,8 @@ class RobustifyConfig:
     n_envs: int = 4
 
     # ── PPO ──────────────────────────────────────────────────────────
-    total_iterations: int = 3000
-    policy_steps: int = 300
+    total_iterations: int = 500
+    policy_steps: int = 512
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -64,7 +64,7 @@ class RobustifyConfig:
     vf_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
-    n_epochs: int = 4
+    n_epochs: int = 5
     batch_size: int = 256
 
     # ── model ────────────────────────────────────────────────────────

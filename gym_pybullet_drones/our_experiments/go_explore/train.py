@@ -37,6 +37,7 @@ def _make_env(cfg: GoExploreConfig) -> OurSingleRLAviary:
         ctrl_freq=cfg.ctrl_freq,
         max_episode_len_sec=cfg.max_episode_len_sec,
         environment_seed=cfg.seed,
+        enable_target_attraction=False,  # No shaping reward in Phase 1
     )
 
 
@@ -89,8 +90,12 @@ def _run_iteration(
     all_actions: List[np.ndarray] = []
     all_n_captured: List[int] = []
 
-    for _ in range(cfg.explore_steps):
-        action = rng.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
+    action = None
+    for step in range(cfg.explore_steps):
+        # Hold each action for 30 steps (~1s at 30Hz ctrl_freq),
+        # then sample a new direction.
+        if step % 30 == 0:
+            action = rng.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
 
         n_cap = int(info.get("target_capture_count", 0))
