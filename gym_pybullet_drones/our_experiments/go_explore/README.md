@@ -65,6 +65,19 @@
    - GAE(λ) 计算 advantage，标准化后训练
    - NaN/Inf 安全防护，跳过无效 batch
 
+4. **TensorBoard 日志对齐**（与 sb3rl 完全可比）
+   - `rollout/ep_rew_mean`、`rollout/ep_len_mean`：最近 100 个 episode 的滑动平均（`deque(maxlen=100)`，与 SB3 `stats_window_size` 默认值一致）
+   - 记录频率：每次 PPO update（即每 `n_steps` 环境步）记录一次，与 SB3 PPO `log_interval=1` 对齐
+   - `eval/mean_reward`、`eval/mean_ep_length`：指标名与 SB3 EvalCallback 一致
+   - 每次训练自动创建编号子目录（`run_1`、`run_2`…），与 SB3 的 `PPO_1`、`PPO_2` 机制类似，避免新旧数据混叠
+
+5. **评估机制**（与 sb3rl EvalCallback 对齐）
+   - 每 `eval_freq`（默认 10000）个环境步触发一次评估
+   - 创建独立的评估环境，使用随机种子运行 `n_eval_episodes`（默认 3）个 episode
+   - 评估时使用**确定性策略**（不含探索噪声），与 SB3 的 `deterministic=True` 一致
+   - 记录 `eval/mean_reward`、`eval/mean_ep_length`、`eval/mean_captures`
+   - 若当前评估 reward 超过历史最佳，自动保存 `best_model.pt`
+
 ## Cell 设计
 
 Cell Key = `(grid_x, grid_y, n_captured_targets)`
@@ -112,7 +125,7 @@ run_all.bat
 
 ```powershell
 # Phase 1: 确定性探索
-python -m gym_pybullet_drones.our_experiments.go_explore.train --total_iterations 20000
+python -m gym_pybullet_drones.our_experiments.go_explore.train --total_iterations 10000
 
 # Bridge: 回放所有成功 cell 动作序列生成多条 Demo
 python -m gym_pybullet_drones.our_experiments.go_explore.gen_demo --archive_path results/go_explore/archive.json
@@ -124,7 +137,7 @@ python -m gym_pybullet_drones.our_experiments.go_explore.robustify --demo_path r
 python -m gym_pybullet_drones.our_experiments.go_explore.demo --model_path results/go_explore_phase2/model_final.pt --n_episodes 3
 
 # Archive Demo: 直接回放 Archive 中成功 Cell 的动作序列
-python -m gym_pybullet_drones.our_experiments.go_explore.demo_archive --archive_path results/go_explore/archive.json --n_demos 3 --playback_speed 2
+python -m gym_pybullet_drones.our_experiments.go_explore.demo_archive --archive_path results/go_explore/archive.json --n_demos 5 --playback_speed 2
 ```
 
 ## 主要参数
@@ -170,6 +183,7 @@ python -m gym_pybullet_drones.our_experiments.go_explore.demo_archive --archive_
 | `batch_size` | 256 | PPO mini-batch 大小 |
 | `obs_embed_dim` | 128 | Obs encoder 输出维度 |
 | `gru_hidden` | 128 | GRU 隐层维度 |
+| `log_interval` | 100 | 控制台打印间隔（PPO 更新次数） |
 
 ## 输出文件
 
@@ -186,7 +200,10 @@ results/go_explore_phase2/
 ├── best_model.pt             # Phase 2 最佳评估模型
 └── model_final.pt            # Phase 2 最终模型
 
-runs/go_explore_phase2/       # TensorBoard 日志
+runs/go_explore_phase2/       # TensorBoard 日志（自动编号子目录）
+├── run_1/                    # 第 1 次训练
+├── run_2/                    # 第 2 次训练
+└── ...
 ```
 
 ## 文件结构

@@ -166,7 +166,7 @@ def run(
     model.learn(
         total_timesteps=int(total_timesteps),
         callback=eval_callback,
-        log_interval=100,
+        log_interval=1 if algo == "ppo" else ALGO_KWARGS["ppo"]["n_steps"],
     )
     model.save(os.path.join(save_dir, "final_model.zip"))
     print(f"\n[INFO] Training complete. Models saved to {save_dir}")
