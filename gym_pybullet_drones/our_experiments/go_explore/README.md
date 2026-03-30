@@ -40,43 +40,31 @@
 
 **多轨迹优势**：多条不同路径的成功经验提升 Phase 2 行为克隆/RL 微调的泛化性和鲁棒性。
 
-### Phase 2：后向课程 + PPO + SIL 鲁棒化（`robustify.py`）
+### Phase 2：SB3 PPO + 后向课程 + SIL 鲁棒化（`robustify.py`）
 
-使用**单环境**训练 GRU Actor-Critic 策略，交替使用 backward waypoint 和 random reset，训练参数与 `sb3rl/train.py` 对齐以确保公平比较：
+直接使用 **Stable-Baselines3 的 PPO**（`MultiInputPolicy`），超参数与 `sb3rl/train.py` 完全一致，仅在其上添加后向课程和 SIL：
 
-1. **交替 Reset**
-   - 奇数 episode：通过 action replay 恢复到 Demo 的 backward waypoint（课程学习）
-   - 偶数 episode：使用随机种子 `env.reset(seed=random)`（泛化训练）
-   - 两种模式交替进行，兼顾课程收敛和环境泛化
+1. **交替 Reset**（`BackwardCurriculumWrapper`）
+   - 每个 episode 以 `curriculum_ratio`（默认 50%）概率选择 backward waypoint 或普通 reset
+   - Backward waypoint：通过 action replay 恢复到 Demo 的当前起点（课程学习）
+   - 普通 reset：`env.reset()` 依赖环境自身随机性（与 `train.py` 一致）
 
 2. **后向课程（Backward Algorithm）**
    - 初始：从 Demo 接近终点的 waypoint 开始（`start_idx = demo_n_steps - backward_step_size`）
-   - 当最近 `eval_window` 个 episode 成功率 ≥ `success_threshold`，起点后退 `backward_step_size` 步
+   - 仅追踪 **curriculum episode** 的成功率（普通 reset episode 不计入）
+   - 至少收集 `eval_window` 个 curriculum episode 结果后开始评估
+   - 成功率 ≥ `success_threshold` 或超过 `max_backward_iters` 次 PPO 更新：起点后退 `backward_step_size` 步
    - 重复直到 `start_idx=0` 且成功率达标
 
-2. **自我模仿学习（SIL）**
-   - Demo 轨迹预加载到 SIL Buffer（循环缓冲区，容量 `sil_capacity`）
-   - 在线高回报轨迹（`ep_reward > sil_online_threshold`）也加入 Buffer
+3. **自我模仿学习（SIL）**（`SILCallback`）
+   - Demo 轨迹预加载到 SIL Buffer
+   - 在线高回报轨迹也加入 Buffer
+   - 每次 PPO rollout 后做 `sil_updates_per_rollout` 次额外梯度更新
    - SIL Loss = `-E[ max(0, R_demo - V(s)) · log π(a_demo|s) ]` + 0.5 · value regression
-   - 与 PPO Loss 联合优化（`total_loss = ppo_loss + sil_coef × sil_loss`）
 
-3. **PPO 细节**（与 sb3rl 一致）
-   - Clipped Surrogate Objective，ratio clamp 至 `[0, 10]`
-   - GAE(λ) 计算 advantage，标准化后训练
-   - NaN/Inf 安全防护，跳过无效 batch
+4. **PPO**：SB3 原生实现，无任何修改
 
-4. **TensorBoard 日志对齐**（与 sb3rl 完全可比）
-   - `rollout/ep_rew_mean`、`rollout/ep_len_mean`：最近 100 个 episode 的滑动平均（`deque(maxlen=100)`，与 SB3 `stats_window_size` 默认值一致）
-   - 记录频率：每次 PPO update（即每 `n_steps` 环境步）记录一次，与 SB3 PPO `log_interval=1` 对齐
-   - `eval/mean_reward`、`eval/mean_ep_length`：指标名与 SB3 EvalCallback 一致
-   - 每次训练自动创建编号子目录（`run_1`、`run_2`…），与 SB3 的 `PPO_1`、`PPO_2` 机制类似，避免新旧数据混叠
-
-5. **评估机制**（与 sb3rl EvalCallback 对齐）
-   - 每 `eval_freq`（默认 10000）个环境步触发一次评估
-   - 创建独立的评估环境，使用随机种子运行 `n_eval_episodes`（默认 3）个 episode
-   - 评估时使用**确定性策略**（不含探索噪声），与 SB3 的 `deterministic=True` 一致
-   - 记录 `eval/mean_reward`、`eval/mean_ep_length`、`eval/mean_captures`
-   - 若当前评估 reward 超过历史最佳，自动保存 `best_model.pt`
+5. **评估**：SB3 `EvalCallback`，与 `sb3rl/train.py` 完全一致
 
 ## Cell 设计
 
@@ -100,17 +88,7 @@ Score 计算: `score = 1/(1 + visit_count) + (n_captured / trajectory_cost) * (m
 
 ## 网络结构
 
-**ObsEncoder**（Per-Key MLP）：
-- `self_state` → MLP(6 → 64 → 64)
-- `target_state` → MLP(54 → 64 → 64)
-- `obstacle_state` → MLP(24 → 64 → 32)
-- 拼接后投影至 `obs_embed_dim`（128）
-
-**ActorCritic**（GRU-based）：
-- GRU（input=128, hidden=128, layers=1）
-- Actor: `Linear(128 → 2)` + learnable log_std, tanh squashing
-- Critic: `Linear(128 → 1)`
-- log_prob 含 tanh correction: `log π(a) = log π(z) - Σ log(1 - tanh²(z))`
+Phase 2 使用 SB3 的 `MultiInputPolicy`（默认 MLP 256×256），与 `sb3rl/train.py` 完全相同。
 
 ## 一键训练
 
@@ -130,11 +108,12 @@ python -m gym_pybullet_drones.our_experiments.go_explore.train --total_iteration
 # Bridge: 回放所有成功 cell 动作序列生成多条 Demo
 python -m gym_pybullet_drones.our_experiments.go_explore.gen_demo --archive_path results/go_explore/archive.json
 
-# Phase 2: 后向课程 + PPO + SIL
+# Phase 2: SB3 PPO + 后向课程 + SIL
 python -m gym_pybullet_drones.our_experiments.go_explore.robustify --demo_path results/go_explore/demos_best.demo.pkl --total_timesteps 1000000
 
-# Demo: 加载模型演示
-python -m gym_pybullet_drones.our_experiments.go_explore.demo --model_path results/go_explore_phase2/model_final.pt --n_episodes 3
+# Demo: 加载 SB3 模型演示
+python -m gym_pybullet_drones.our_experiments.go_explore.demo --model_path results/go_explore_phase2/best_model.zip --n_episodes 3
+
 
 # Archive Demo: 直接回放 Archive 中成功 Cell 的动作序列
 python -m gym_pybullet_drones.our_experiments.go_explore.demo_archive --archive_path results/go_explore/archive.json --n_demos 5 --playback_speed 2
@@ -169,21 +148,20 @@ python -m gym_pybullet_drones.our_experiments.go_explore.demo_archive --archive_
 | `n_eval_episodes` | 3 | 每次评估的 episode 数 |
 | `backward_step_size` | 50 | 每次后退的 waypoint 步数 |
 | `success_threshold` | 0.8 | 触发后退的成功率 |
-| `eval_window` | 20 | 成功率滑动窗口大小（episodes） |
-| `max_backward_iters` | 200 | 单个 level 最大 PPO 更新数 |
+| `eval_window` | 20 | 成功率滑动窗口大小（curriculum episodes） |
+| `max_backward_iters` | 30 | 单个 level 最大 PPO 更新数 |
 | `success_captures` | 18 | "成功"所需的目标覆盖数 |
+| `curriculum_ratio` | 0.5 | backward waypoint reset 的概率 |
 | `sil_coef` | 0.1 | SIL Loss 权重 |
 | `sil_capacity` | 50000 | SIL Buffer 容量 |
+| `sil_updates_per_rollout` | 5 | 每次 PPO rollout 后的 SIL 梯度步数 |
 | `lr` | 3e-4 | Adam 学习率 |
 | `gamma` | 0.99 | 折扣因子 |
 | `gae_lambda` | 0.95 | GAE λ |
-| `clip_eps` | 0.2 | PPO clip ε |
-| `entropy_coef` | 0.01 | 熵正则系数 |
+| `clip_range` | 0.2 | PPO clip range |
+| `ent_coef` | 0.01 | 熵正则系数 |
 | `n_epochs` | 5 | PPO mini-epoch 数 |
 | `batch_size` | 256 | PPO mini-batch 大小 |
-| `obs_embed_dim` | 128 | Obs encoder 输出维度 |
-| `gru_hidden` | 128 | GRU 隐层维度 |
-| `log_interval` | 100 | 控制台打印间隔（PPO 更新次数） |
 
 ## 输出文件
 
@@ -197,12 +175,13 @@ results/go_explore/
 └── demos_best.demo.pkl       # 最优单条 Demo（向后兼容）
 
 results/go_explore_phase2/
-├── best_model.pt             # Phase 2 最佳评估模型
-└── model_final.pt            # Phase 2 最终模型
+├── best_model.zip            # Phase 2 最佳评估模型（SB3 格式）
+├── final_model.zip           # Phase 2 最终模型（SB3 格式）
+└── evaluations.npz           # 评估记录
 
-runs/go_explore_phase2/       # TensorBoard 日志（自动编号子目录）
-├── run_1/                    # 第 1 次训练
-├── run_2/                    # 第 2 次训练
+runs/go_explore_phase2/       # TensorBoard 日志（SB3 自动编号）
+├── PPO_1/                    # 第 1 次训练
+├── PPO_2/                    # 第 2 次训练
 └── ...
 ```
 
@@ -212,13 +191,10 @@ runs/go_explore_phase2/       # TensorBoard 日志（自动编号子目录）
 |---|---|
 | `train.py` | Phase 1：确定性探索主循环（动作回放 + Pareto 更新 + sticky action） |
 | `gen_demo.py` | Bridge：回放所有成功 cell 动作序列生成多条 Demo（含 MC returns） |
-| `robustify.py` | Phase 2：后向课程 + PPO + SIL + 交替 reset + TensorBoard |
-| `demo.py` | 加载 Phase 2 模型进行 GUI 演示 |
+| `robustify.py` | Phase 2：SB3 PPO + 后向课程 Wrapper + SIL Callback |
+| `demo.py` | 加载 Phase 2 SB3 模型进行 GUI 演示 |
 | `demo_archive.py` | 直接回放 Archive 中成功 Cell 的动作序列（支持变速播放） |
 | `run_all.bat` | 一键训练脚本（Phase 1 → Bridge → Phase 2 → Demo） |
 | `config.py` | Phase 1 超参数（`GoExploreConfig` dataclass） |
 | `archive.py` | Per-Cell Archive 实现（Pareto 更新 + Done Cell 过滤 + 持久化） |
-| `networks.py` | Per-Key MLP ObsEncoder + GRU ActorCritic（tanh squashing） |
-| `ppo.py` | PPO + SIL 联合训练器（含 NaN 安全防护） |
 | `sil_buffer.py` | 循环 SIL 回放缓冲区（demo 预加载 + 在线高回报轨迹） |
-| `rollout_buffer.py` | GAE Rollout Buffer（标准 PPO 数据收集） |
