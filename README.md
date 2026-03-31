@@ -95,6 +95,43 @@ cd gym_pybullet_drones/examples/
 python3 cf.py
 ```
 
+## Our Experiments (SEAM-RL)
+
+本项目在 `gym_pybullet_drones/our_experiments/` 下实现了面向 **动态环境下无人机多目标覆盖导航** 的强化学习研究，对应 RA-L 投稿论文 **SEAM-RL**。
+
+### 研究问题
+
+在包含动态障碍物的复杂环境中，无人机导航面临两大挑战：
+1. **稀疏奖励** 导致探索效率极低
+2. **策略短视** 导致导航决策质量低下
+
+### 方法：SEAM-RL（两阶段解耦）
+
+| 阶段 | 目标 | 方法 |
+|------|------|------|
+| Phase 1 | 高效探索 | **SGE**：SAC-guided Go-Explore，最大熵策略驱动探索 |
+| Phase 2 | 策略学习 | **EA-Mamba** 策略网络 + SIL + 后向课程 + PPO |
+
+### 实验模块
+
+| 模块 | 说明 | 角色 |
+|------|------|------|
+| [`sge_ea_mamba_rl/`](gym_pybullet_drones/our_experiments/sge_ea_mamba_rl/) | **SEAM-RL（完整版）**：Entity Attention + Mamba | 我们的方法 |
+| [`sge_ea_rl/`](gym_pybullet_drones/our_experiments/sge_ea_rl/) | Entity Attention only（无 Mamba） | 消融实验 |
+| [`sge_mamba_rl/`](gym_pybullet_drones/our_experiments/sge_mamba_rl/) | Mamba only（无 Entity Attention） | 消融实验 |
+| [`go_explore/`](gym_pybullet_drones/our_experiments/go_explore/) | 原版 Go-Explore + 后向课程 | 对比基线 |
+| [`sb3rl/`](gym_pybullet_drones/our_experiments/sb3rl/) | 标准 SB3 算法（PPO/SAC/TD3/DDPG） | 对比基线 |
+
+### 快速开始
+
+```bash
+# SEAM-RL 完整训练流程（Phase 1 + Phase 2）
+cd gym_pybullet_drones/our_experiments/sge_ea_mamba_rl/
+run_all.bat
+```
+
+详见各模块目录下的 `README.md`。
+
 ## Citation
 
 If you wish, please cite our [IROS 2021 paper](https://arxiv.org/abs/2103.02142) ([and original codebase](https://github.com/utiasDSL/gym-pybullet-drones/tree/paper)) as
